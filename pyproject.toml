@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=63.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+dynamic = ["version", "dependencies"]
+name = "a3em-ai"
+authors = [
+  {name = "Will Hedgecock", email = "ronald.w.hedgecock@vanderbilt.edu"}
+]
+maintainers = [
+  {name = "Will Hedgecock", email = "ronald.w.hedgecock@vanderbilt.edu"}
+]
+readme = "README.rst"
+description = "Python package for developing small AI models that can run on a microcontroller"
+requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE.*"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Education",
+  "Intended Audience :: Science/Research",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+]
+
+[project.urls]
+Homepage = "https://github.com/vu-a3em/a3em-ai"
+Documentation = "https://github.com/vu-a3em/a3em-ai"
+Repository = "https://github.com/vu-a3em/a3em-ai"
+
+[tool.setuptools.dynamic]
+version = {attr = "microesc.__version__"}
+dependencies = {file = ["requirements.txt"]}

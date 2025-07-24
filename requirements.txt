@@ -1,0 +1,19 @@
+# Core dependencies
+tensorflow==2.19.0
+tensorflow-metal==1.2.0; sys_platform == 'darwin'
+torch==2.7.1
+ai-edge-litert==1.3.0
+ai-edge-torch==0.5.0
+ai-edge-model-explorer
+matplotlib
+librosa
+seaborn
+
+# Temporary dependencies until Keras 3.0 releases built-in support for quantization-aware training
+tf-keras==2.19.0
+tensorflow-model-optimization
+
+# Pretrained models and utilities
+tensorflow-hub
+torchvision
+torchaudio
