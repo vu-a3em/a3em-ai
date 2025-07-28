@@ -13,8 +13,9 @@ model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-4),  # type: igno
 model.summary()
 
 # Create the full audio dataset and split it into a training and testing dataset
-dataset_path = '/Volumes/AIDataSets/DataSet'
-dataset = RavenProDataSet(dataset_path, target_sample_rate_hz=8000, training_split_percent=0.8)
+audio_path = '/Volumes/AIDataSets/DataSet/audio'
+annotation_path = '/Volumes/AIDataSets/DataSet/annotations'
+dataset = RavenProDataSet(audio_path, annotation_path, target_sample_rate_hz=8000, target_clip_length=3.0, training_split_percent=0.8, uniform_classes_per_batch=False)
 train_ds = dataset.train_dataset(batch_size=32)
 test_ds = dataset.test_dataset(batch_size=32)
 dataset.summary()

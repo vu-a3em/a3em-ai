@@ -44,8 +44,8 @@ def _make_resnet(x):
 # Function to create the full ResNet50 model
 def create_resnet50_model(params: Resnet50Params, load_pretrained_weights: bool, freeze_pretrained_layers: bool) -> keras.Model:
   bn_axis = 3 if keras.backend.image_data_format() == 'channels_last' else 1
-  input = keras.layers.Input(shape=(224,224,3,), dtype='float32')
-  x = keras.layers.ZeroPadding2D(padding=((3, 3), (3, 3)))(input)
+  data_in = keras.layers.Input(shape=(224,224,3,), dtype='float32')
+  x = keras.layers.ZeroPadding2D(padding=((3, 3), (3, 3)))(data_in)
   x = keras.layers.Conv2D(filters=64, kernel_size=7, strides=2, use_bias=params.use_conv_bias)(x)
   x = keras.layers.BatchNormalization(axis=bn_axis, epsilon=1.001e-5)(x)
   x = keras.layers.ReLU()(x)
@@ -54,7 +54,7 @@ def create_resnet50_model(params: Resnet50Params, load_pretrained_weights: bool,
   x = _make_resnet(x)
   x = keras.layers.GlobalAveragePooling2D()(x)
   x = keras.layers.Dense(units=params.num_classes, activation=params.classifier_activation)(x)
-  model = keras.Model(inputs=input, outputs=x, name='ResNet50')
+  model = keras.Model(inputs=data_in, outputs=x, name='ResNet50')
 
   if load_pretrained_weights:
     file_name = 'resnet50_weights_tf_dim_ordering_tf_kernels.h5'

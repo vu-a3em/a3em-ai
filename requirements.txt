@@ -8,6 +8,7 @@ ai-edge-model-explorer
 matplotlib
 librosa
 seaborn
+pandas
 
 # Temporary dependencies until Keras 3.0 releases built-in support for quantization-aware training
 tf-keras==2.19.0
