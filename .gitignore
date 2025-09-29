@@ -178,3 +178,5 @@ __marimo__/
 
 # Thumbnails
 ._*
+yamnet.keras
+yamnetmini.keras

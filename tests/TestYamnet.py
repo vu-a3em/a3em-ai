@@ -15,11 +15,16 @@ model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-4),  # type: igno
 model.summary()
 
 # Create the full audio dataset and split it into a training and testing dataset
-dataset_path = '/Volumes/AIDataSets/DataSet'
+dataset_path = '/isis/home/steing/AIDataSet'
 event_detector = SpectralFluxDetector(9.0, 8000, 512, 256, False, 150.0, 1800.0, 0.100)
-dataset = DirectoryDataSet(dataset_path, params.sample_rate, params.patch_window_seconds + params.stft_window_seconds - params.stft_hop_seconds, 0.8, False, 0.3, event_detector, 0.1)
-train_ds = dataset.train_dataset(batch_size=32)
-test_ds = dataset.test_dataset(batch_size=32)
+
+ignore_dirs = ['Gunshot',  'Fireworks', 'Drums', 'Engine', 'Noise']
+
+dataset = DirectoryDataSet(dataset_path, params.sample_rate, params.patch_window_seconds + params.stft_window_seconds - params.stft_hop_seconds, 0.8, False, 0.3, event_detector, 0.1, ignore_directories=ignore_dirs)
+
+batch_size = 16
+train_ds = dataset.train_dataset(batch_size=batch_size)
+test_ds = dataset.test_dataset(batch_size=batch_size)
 dataset.summary()
 
 # Train and save the best model

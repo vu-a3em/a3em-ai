@@ -4,6 +4,7 @@ from ..detection import EventDetector
 from typing import List, Tuple
 import glob, os, math, random, librosa
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 class AudioClip:
 
@@ -64,13 +65,53 @@ class KerasDataSet(PyDataset):
     high = min(low + self.batch_size, len(self.dataset))
     for clip in self.dataset[low:high]:
       with clip.audio as audio:
-        batch_data.append(audio.data)
+        # scale to keep audio within -1.0 to +1.0
+        scale = np.max(np.abs(audio.data)) if np.max(np.abs(audio.data)) > 0 else 1.0
+        batch_data.append(audio.data / scale)
+        
         batch_labels.append(clip.label_idx)
     return np.array(batch_data), np.array(batch_labels)
 
   def on_epoch_end(self):
     random.shuffle(self.dataset)
 
+
+
+def _process_audio_file(args):
+  file, idx, label, target_sample_rate_hz, target_clip_length, event_start_offset, event_detector, event_detector_match_metadata_leeway_seconds, parse_metadata_func = args
+  clips = []
+  try:
+    audio_length_seconds = librosa.get_duration(path=file)
+    metadata = None
+    if (event_detector and event_detector_match_metadata_leeway_seconds is not None) or target_clip_length:
+      metadata_file = file[:-4] + '.meta'
+      if os.path.exists(metadata_file):
+        metadata = parse_metadata_func(metadata_file)
+
+    if event_detector:
+      for event_onset in event_detector.detect_events(file):
+        if not metadata or np.isclose(metadata, event_onset, atol=event_detector_match_metadata_leeway_seconds).any():
+          event_onset -= event_start_offset
+          event_end_time = (event_onset + target_clip_length) if target_clip_length else None
+          if event_onset >= 0.0 and (not event_end_time or event_end_time <= audio_length_seconds):
+            clips.append(AudioClip(idx, label, file, event_onset, event_end_time, target_sample_rate_hz))
+    elif target_clip_length:
+      if metadata:
+        for start_time in metadata:
+          event_onset = start_time - event_start_offset
+          event_end_time = event_onset + target_clip_length
+          if event_onset >= 0.0 and event_end_time <= audio_length_seconds:
+            clips.append(AudioClip(idx, label, file, event_onset, event_end_time, target_sample_rate_hz))
+      else:
+        for start_time in np.arange(0, audio_length_seconds, target_clip_length):
+          event_end_time = start_time + target_clip_length
+          if event_end_time <= audio_length_seconds:
+            clips.append(AudioClip(idx, label, file, start_time, event_end_time, target_sample_rate_hz))
+    else:
+      clips.append(AudioClip(idx, label, file, 0.0, target_clip_length, target_sample_rate_hz))
+  except Exception as e:
+    print(f"Error processing {file}: {e}")
+  return clips
 
 class DirectoryDataSet:
 
@@ -82,77 +123,42 @@ class DirectoryDataSet:
                uniform_classes_per_batch: bool = False,
                event_start_offset: float = 0.0,
                event_detector: EventDetector | None = None,
-               event_detector_match_metadata_leeway_seconds: float | None = None):
+               event_detector_match_metadata_leeway_seconds: float | None = None,
+               ignore_directories: List[str] = []
+               ):
+
 
     # Create structures to hold audio clips and labels
     self.clips, self.labels, self.label_counts = [], set(), defaultdict(int)
     self.label_to_idx, self.idx_to_label = {}, {}
 
-    # Iterate through all directories in the base path (which should correspond to class labels)
-    for idx, dir in enumerate(glob.glob(os.path.join(os.path.abspath(base_path), '*'))):
+    files_to_process = []
+    # Gather all files and their arguments
+    idx = 0
+    for dir in glob.glob(os.path.join(os.path.abspath(base_path), '*')):
+        if not os.path.isdir(dir) or os.path.basename(dir) in ignore_directories:
+            print(f"Ignoring directory: {dir}")
+            continue
+        label = os.path.basename(dir)
+        self.labels.add(label)
+        self.label_to_idx[label] = idx
+        self.idx_to_label[idx] = label
+        for file in glob.glob(os.path.join(dir, '**'), recursive=True):
+            if file.lower().endswith(('.wav', '.mp3', '.ogg', '.m4a', '.aac')):
+                files_to_process.append((
+                    file, idx, label, target_sample_rate_hz, target_clip_length,
+                    event_start_offset, event_detector, event_detector_match_metadata_leeway_seconds,
+                    self._parse_metadata
+                ))
+        idx += 1
 
-      # Get the label from the directory name and create a label index
-      label = os.path.basename(dir)
-      self.labels.add(label)
-      self.label_to_idx[label] = idx
-      self.idx_to_label[idx] = label
-
-      # Iterate through all audio files in the directory
-      for file in glob.glob(os.path.join(dir, '**'), recursive=True):
-        if file.lower().endswith(('.wav', '.mp3', '.ogg', '.m4a', '.aac')):
-          audio_length_seconds = librosa.get_duration(path=file)
-
-          # Search for a metadata file if requested
-          metadata = None
-          if (event_detector and event_detector_match_metadata_leeway_seconds is not None) or target_clip_length:
-            metadata_file = file[:-4] + '.meta'
-            if os.path.exists(metadata_file):
-              metadata = self._parse_metadata(metadata_file)
-            else:
-              print(f"Metadata file for {file} does not exist, ignoring metadata...")
-
-          # Create audio clips for each file based on either event detection output or fixed-length segmentation
-          if event_detector:
-            for event_onset in event_detector.detect_events(file):
-
-              # Check if the event onset matches any metadata-specified onsets
-              if not metadata or np.isclose(metadata, event_onset, atol=event_detector_match_metadata_leeway_seconds).any():  # type: ignore
-
-                # Place the start of the event at the specified offset within the clip
-                event_onset -= event_start_offset
-                event_end_time = (event_onset + target_clip_length) if target_clip_length else None
-
-                # Only create a clip if the start and end times are valid
-                if event_onset >= 0.0 and (not event_end_time or event_end_time <= audio_length_seconds):
-                  clip = AudioClip(idx, label, file, event_onset, event_end_time, target_sample_rate_hz)
-                  self.label_counts[label] += 1
-                  self.clips.append(clip)
-
-          elif target_clip_length:
-
-            # If metadata is provided, create clips based on the metadata
-            if metadata:
-              for start_time in metadata:
-                event_onset = start_time - event_start_offset
-                event_end_time = event_onset + target_clip_length
-                if event_onset >= 0.0 and event_end_time <= audio_length_seconds:
-                  clip = AudioClip(idx, label, file, event_onset, event_end_time, target_sample_rate_hz)
-                  self.label_counts[label] += 1
-                  self.clips.append(clip)
-
-            # Otherwise, create clips based on fixed-length segmentation
-            else:
-              for start_time in np.arange(0, audio_length_seconds, target_clip_length):
-                event_end_time = start_time + target_clip_length
-                if event_end_time <= audio_length_seconds:
-                  clip = AudioClip(idx, label, file, start_time, event_end_time, target_sample_rate_hz)
-                  self.label_counts[label] += 1
-                  self.clips.append(clip)
-
-          else:
-            clip = AudioClip(idx, label, file, 0.0, target_clip_length, target_sample_rate_hz)
-            self.label_counts[label] += 1
-            self.clips.append(clip)
+    # Parallel processing using ThreadPoolExecutor
+    with ThreadPoolExecutor() as executor:
+        futures = [executor.submit(_process_audio_file, args) for args in files_to_process]
+        for future in as_completed(futures):
+            for clip in future.result():
+                self.clips.append(clip)
+                self.label_counts[clip.label] += 1
 
     # Augment dataset if uniform classes per batch is requested
     if uniform_classes_per_batch:
@@ -191,7 +197,7 @@ class DirectoryDataSet:
     print(f"   \033[1mTotal clips:\033[0m {len(self.clips)}")
     print(f"   \033[1mTraining clips:\033[0m {len(self.training_clips)}")
     print(f"   \033[1mTest clips:\033[0m {len(self.test_clips)}")
-    print("   \033[1mLabels and Counts:\033[0m")
+    print(f"   \033[1mLabels (total {len(self.label_counts)}) and Counts:\033[0m")
     for label, count in sorted(self.label_counts.items()):
       print(f"      {label}: {count}")
     print()
