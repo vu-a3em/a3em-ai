@@ -4,6 +4,7 @@ from microesc.detection.SpectralFluxDetector import SpectralFluxDetector
 from microesc import keras
 import tensorflow_model_optimization as tfmot
 import microesc.tools as tools
+import itertools
 
 ignore_dirs = ['Gunshot',  'Fireworks', 'Drums', 'Engine', 'Noise']
 
@@ -11,19 +12,8 @@ ignore_dirs = ['Gunshot',  'Fireworks', 'Drums', 'Engine', 'Noise']
 params = YamnetParams()
 params.num_classes = 38 - len(ignore_dirs) 
 
-def build_mini_yamnet_model(params: YamnetParams) -> keras.Model:
+def build_mini_yamnet_model(params: YamnetParams, blocks , dense_units) -> keras.Model:
   # A smaller version of Yamnet for less capable hardware
-  blocks = [
-    (64, [3, 3], 1),
-    (128, [3, 3], 2),
-    (128, [3, 3], 1),
-    (256, [3, 3], 2),
-    (256, [3, 3], 1),
-    (512, [3, 3], 2),
-  ]
-
-  dense_units = [512, 256]
-
   def _build_block(filters: int, kernel_size: list, strides: int) -> list[keras.layers.Layer]:
     return [
       keras.layers.DepthwiseConv2D(kernel_size=kernel_size, strides=strides, depth_multiplier=1, padding=params.conv_padding, use_bias=False),
@@ -70,16 +60,81 @@ def build_mini_yamnet_model(params: YamnetParams) -> keras.Model:
   model = keras.Sequential(name='YAMNET-MINI', layers=layers)
   return model
 
-model = build_mini_yamnet_model(params)
-model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-4),  # type: ignore
-              loss=keras.losses.SparseCategoricalCrossentropy(),
-              metrics=[keras.metrics.SparseCategoricalAccuracy()])
-model.summary()
+
+
+block_configs = [
+  # # Full
+  # [
+  #   (64, [3, 3], 1),
+  #   (128, [3, 3], 2),
+  #   (128, [3, 3], 1),
+  #   (256, [3, 3], 2),
+  #   (256, [3, 3], 1),
+  #   (512, [3, 3], 2),
+  #   (512, [3, 3], 1),
+  #   (512, [3, 3], 1),
+  #   (512, [3, 3], 1),
+  #   (512, [3, 3], 1),
+  #   (512, [3, 3], 1),
+  #   (1024, [3, 3], 2),
+  #   (1024, [3, 3], 1),
+  # ],
+  # # Larger
+  # [
+  #   (64, [3, 3], 1),
+  #   (128, [3, 3], 2),
+  #   (128, [3, 3], 1),
+  #   (256, [3, 3], 2),
+  #   (256, [3, 3], 1),
+  #   (512, [3, 3], 2),
+  #   (512, [3, 3], 1),
+  #   (1024, [3, 3], 2),
+  # ],
+  # # Original
+  # [
+  #   (64, [3, 3], 1),
+  #   (128, [3, 3], 2),
+  #   (128, [3, 3], 1),
+  #   (256, [3, 3], 2),
+  #   (256, [3, 3], 1),
+  #   (512, [3, 3], 2),
+  # ],
+  # Smaller
+  [
+    (64, [3, 3], 1),
+    (128, [3, 3], 2),
+    (128, [3, 3], 1),
+    (256, [3, 3], 2),
+    (256, [3, 3], 1),
+  ],
+  # Even smaller
+  [
+    (64, [3, 3], 1),
+    (128, [3, 3], 2),
+    (128, [3, 3], 1),
+    (256, [3, 3], 2),
+  ],
+  # Tiny
+  [
+    (64, [3, 3], 1),
+    (128, [3, 3], 2),
+    (128, [3, 3], 1),
+  ]
+]
+
+dense_configs = [
+  [],
+  [128],
+  [128, 128],
+]
+
+evals = []
+
+configs = list(itertools.product(block_configs, dense_configs))
 
 # Create the full audio dataset and split it into a training and testing dataset
 dataset_path = '/isis/home/steing/AIDataSet'
 event_detector = SpectralFluxDetector(9.0, 8000, 512, 256, False, 150.0, 1800.0, 0.100)
-
 
 dataset = DirectoryDataSet(dataset_path, params.sample_rate, params.patch_window_seconds + params.stft_window_seconds - params.stft_hop_seconds, 0.8, False, 0.3, event_detector, 0.1, ignore_directories=ignore_dirs)
 
@@ -97,14 +152,29 @@ dataset.summary()
 #           if x[i] > 1.0 or x[i] < -1.0:
 #             print(f"{i:03d}: {x[i]}")
 
+for (blocks, dense_units) in configs:
+  print(f"Testing Yamnet-Mini with blocks={blocks} and dense_units={dense_units}")
+  model = build_mini_yamnet_model(params, blocks=blocks, dense_units=dense_units)
+  model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-4),  # type: ignore
+                loss=keras.losses.SparseCategoricalCrossentropy(),
+                metrics=[keras.metrics.SparseCategoricalAccuracy()])
+  model.summary()
 
-# Train and save the best model
-callback = keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
-history: keras.callbacks.History = model.fit(train_ds, epochs=10000, validation_data=test_ds, callbacks=[callback], verbose=2)  # type: ignore
-model.evaluate(test_ds, return_dict=True)
-tools.plot_training_history(history)
-tools.plot_confusion_matrix(model, test_ds, dataset.idx_to_label)
-model.save('yamnetmini.keras')
+
+  # Train and save the best model
+  callback = keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+  history: keras.callbacks.History = model.fit(train_ds, epochs=10000, validation_data=test_ds, callbacks=[callback], verbose=2)  # type: ignore
+  val_eval = model.evaluate(test_ds, return_dict=True)
+  evals.append((blocks, dense_units, val_eval))
+  #tools.plot_training_history(history)
+  #tools.plot_confusion_matrix(model, test_ds, dataset.idx_to_label)
+  #model.save('yamnetmini.keras')
+
+for (blocks, dense_units, eval) in evals:
+  print(f"Yamnet-Mini with blocks={blocks} and dense_units={dense_units} achieved test accuracy {eval['sparse_categorical_accuracy']*100:.2f}%")
+
+# Skip quantization-aware training for now
+exit()
 
 # Create a quantization-aware version of the trained model
 from microesc.classification.Yamnet import WaveformToLogMel
