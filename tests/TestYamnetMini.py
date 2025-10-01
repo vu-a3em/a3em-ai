@@ -172,8 +172,10 @@ test_ds = tf.data.Dataset.from_tensor_slices((X_test, y_test)).batch(batch_size)
 # Create new classifier model for the extracted features
 classifier = keras.Sequential([
     keras.layers.Input(shape=model.output.shape[1:], dtype='float32'),
-    keras.layers.Dense(units=params.num_classes * 4, use_bias=True, activation='relu'),
-    keras.layers.Dropout(0.3),
+    keras.layers.Dense(units=256, use_bias=True, activation='relu'),
+    keras.layers.Dropout(0.25),
+    keras.layers.Dense(units=128, use_bias=True, activation='relu'),
+    keras.layers.Dropout(0.25),
     keras.layers.Dense(units=params.num_classes, use_bias=True, activation=params.classifier_activation)
 ])
 lr_schedule = keras.callbacks.ReduceLROnPlateau(
@@ -194,8 +196,8 @@ classifier.fit(train_ds, epochs=10000, validation_data=test_ds, callbacks=[callb
 val_eval = classifier.evaluate(test_ds, return_dict=True)
 print(f"Yamnet-Mini + classifier achieved test accuracy {val_eval['sparse_categorical_accuracy']*100:.2f}%")
 
-tools.plot_training_history(history)
-tools.plot_confusion_matrix(classifier, test_ds, dataset.idx_to_label)
+#tools.plot_training_history(history)
+#tools.plot_confusion_matrix(classifier, test_ds, dataset.idx_to_label)
 classifier.save('yamnet_adapter.keras')
 
 

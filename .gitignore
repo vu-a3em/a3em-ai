@@ -180,3 +180,4 @@ __marimo__/
 ._*
 yamnet.keras
 yamnetmini.keras
+yamnet_adapter.keras
