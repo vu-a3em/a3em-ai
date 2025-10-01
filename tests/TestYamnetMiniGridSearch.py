@@ -1,15 +1,12 @@
-import os
 from microesc.datasets.DirectoryDataSet import DirectoryDataSet
-from microesc.classification.Yamnet import create_yamnet_model, YamnetParams, WaveformToLogMel
+from microesc.classification.Yamnet import YamnetParams
 from microesc.detection.SpectralFluxDetector import SpectralFluxDetector
 from microesc import keras
 import tensorflow_model_optimization as tfmot
-import microesc.tools as tools
 import itertools
-import tensorflow as tf
-import numpy as np
 
 from microesc.classification.yamnetmini import build_mini_yamnet_model
+
 
 ignore_dirs = ['Gunshot',  'Fireworks', 'Drums', 'Engine', 'Noise']
 
@@ -17,8 +14,8 @@ ignore_dirs = ['Gunshot',  'Fireworks', 'Drums', 'Engine', 'Noise']
 params = YamnetParams()
 params.num_classes = 38 - len(ignore_dirs) 
 
-blocks = [
-  # Full
+block_configs = [
+  # # Full
   # [
   #   (64, [3, 3], 1),
   #   (128, [3, 3], 2),
@@ -55,29 +52,37 @@ blocks = [
   #   (512, [3, 3], 2),
   # ],
   # # Smaller
-    (64, [3, 3], 1),
-    (128, [3, 3], 2),
-    (128, [3, 3], 1),
-    (256, [3, 3], 2),
-    (256, [3, 3], 1),
-  # Even smaller
   # [
   #   (64, [3, 3], 1),
   #   (128, [3, 3], 2),
   #   (128, [3, 3], 1),
   #   (256, [3, 3], 2),
-  # ]
+  #   (256, [3, 3], 1),
+  # ],
+  # Even smaller
+  [
+    (64, [3, 3], 1),
+    (128, [3, 3], 2),
+    (128, [3, 3], 1),
+    (256, [3, 3], 2),
+  ],
   # Tiny
-  # [
-  #   (64, [3, 3], 1),
-  #   (128, [3, 3], 2),
-  #   (128, [3, 3], 1),
-  # ]
+  [
+    (64, [3, 3], 1),
+    (128, [3, 3], 2),
+    (128, [3, 3], 1),
+  ]
 ]
 
-dense_units = []
+dense_configs = [
+  [],
+  [128],
+  [128, 128],
+]
 
 evals = []
+
+configs = list(itertools.product(block_configs, dense_configs))
 
 # Create the full audio dataset and split it into a training and testing dataset
 dataset_path = '/isis/home/steing/AIDataSet'
@@ -99,10 +104,7 @@ dataset.summary()
 #           if x[i] > 1.0 or x[i] < -1.0:
 #             print(f"{i:03d}: {x[i]}")
 
-if os.path.exists('yamnetmini.keras'):
-  print("Loading existing Yamnet-Mini model from yamnetmini.keras")
-  model = keras.models.load_model('yamnetmini.keras')
-else:
+for (blocks, dense_units) in configs:
   print(f"Testing Yamnet-Mini with blocks={blocks} and dense_units={dense_units}")
   model = build_mini_yamnet_model(params, blocks=blocks, dense_units=dense_units)
   # Learning rate schedule: reduce LR on plateau
@@ -129,75 +131,13 @@ else:
       verbose=2
   )  # type: ignore
   val_eval = model.evaluate(test_ds, return_dict=True)
-  tools.plot_training_history(history)
-  tools.plot_confusion_matrix(model, test_ds, dataset.idx_to_label)
-  model.save('yamnetmini.keras')
+  evals.append((blocks, dense_units, val_eval))
+  #tools.plot_training_history(history)
+  #tools.plot_confusion_matrix(model, test_ds, dataset.idx_to_label)
+  #model.save('yamnetmini.keras')
 
-  print(f"Yamnet-Mini with blocks={blocks} and dense_units={dense_units} achieved test accuracy {val_eval['sparse_categorical_accuracy']*100:.2f}%")
-
-
-# Pop off dense layer
-model.pop()
-
-# Use model for feature extraction on entire dataset
-# Preprocess the datasets to extract embeddings using the frozen Yamnet model
-def extract_yamnet_embeddings(waveforms, labels):
-  embeddings = model(waveforms, training=False)
-  return embeddings, labels
-
-# Generate embeddings to numpy arrays once, then create new tf.data.Dataset objects
-def generate_embedding_dataset(seq):
-  """Takes a KerasDataSet (keras.utils.Sequence) and returns (X, y) numpy arrays of embeddings and labels."""
-  embs = []
-  lbls = []
-  for i in range(len(seq)):
-    batch_waveforms, batch_labels = seq[i]
-    batch_embs = model(batch_waveforms, training=False)
-    # Convert to numpy if it's a Tensor
-    if hasattr(batch_embs, 'numpy'):
-      batch_embs = batch_embs.numpy()
-    embs.append(batch_embs)
-    lbls.append(batch_labels)
-  X = np.concatenate(embs, axis=0) if len(embs) > 0 else np.empty((0,) + model.output.shape[1:], dtype=np.float32)
-  y = np.concatenate(lbls, axis=0) if len(lbls) > 0 else np.empty((0,), dtype=np.int64)
-  return X, y
-
-# Precompute and rebuild datasets
-X_train, y_train = generate_embedding_dataset(train_ds)
-X_test, y_test = generate_embedding_dataset(test_ds)
-
-train_ds = tf.data.Dataset.from_tensor_slices((X_train, y_train)).shuffle(len(y_train) if len(y_train) > 0 else 1).batch(batch_size).prefetch(tf.data.AUTOTUNE)
-test_ds = tf.data.Dataset.from_tensor_slices((X_test, y_test)).batch(batch_size).prefetch(tf.data.AUTOTUNE)
-
-# Create new classifier model for the extracted features
-classifier = keras.Sequential([
-    keras.layers.Input(shape=model.output.shape[1:], dtype='float32'),
-    keras.layers.Dense(units=params.num_classes * 4, use_bias=True, activation='relu'),
-    keras.layers.Dropout(0.3),
-    keras.layers.Dense(units=params.num_classes, use_bias=True, activation=params.classifier_activation)
-])
-lr_schedule = keras.callbacks.ReduceLROnPlateau(
-    monitor='val_loss',
-    factor=0.5,
-    patience=5,
-    min_lr=1e-7,
-    verbose=1
-)
-callback = keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
-
-classifier.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-4),
-              loss=keras.losses.SparseCategoricalCrossentropy(),
-              metrics=[keras.metrics.SparseCategoricalAccuracy()])
-classifier.summary()
-
-classifier.fit(train_ds, epochs=10000, validation_data=test_ds, callbacks=[callback, lr_schedule], verbose=2)
-val_eval = classifier.evaluate(test_ds, return_dict=True)
-print(f"Yamnet-Mini + classifier achieved test accuracy {val_eval['sparse_categorical_accuracy']*100:.2f}%")
-
-tools.plot_training_history(history)
-tools.plot_confusion_matrix(classifier, test_ds, dataset.idx_to_label)
-classifier.save('yamnet_adapter.keras')
-
+for (blocks, dense_units, eval) in evals:
+  print(f"Yamnet-Mini with blocks={blocks} and dense_units={dense_units} achieved test accuracy {eval['sparse_categorical_accuracy']*100:.2f}%")
 
 # Skip quantization-aware training for now
 exit()
