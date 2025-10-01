@@ -6,61 +6,13 @@ import tensorflow_model_optimization as tfmot
 import microesc.tools as tools
 import itertools
 
+from yamnetmini import build_mini_yamnet_model
+
 ignore_dirs = ['Gunshot',  'Fireworks', 'Drums', 'Engine', 'Noise']
 
 # Generate the Yamnet model
 params = YamnetParams()
 params.num_classes = 38 - len(ignore_dirs) 
-
-def build_mini_yamnet_model(params: YamnetParams, blocks , dense_units) -> keras.Model:
-  # A smaller version of Yamnet for less capable hardware
-  def _build_block(filters: int, kernel_size: list, strides: int) -> list[keras.layers.Layer]:
-    return [
-      keras.layers.DepthwiseConv2D(kernel_size=kernel_size, strides=strides, depth_multiplier=1, padding=params.conv_padding, use_bias=False),
-      keras.layers.BatchNormalization(center=params.batchnorm_center, scale=params.batchnorm_scale, epsilon=params.batchnorm_epsilon),
-      keras.layers.ReLU(max_value=6.0),
-      keras.layers.Conv2D(filters=filters, kernel_size=[1, 1], strides=1, padding=params.conv_padding, use_bias=False),
-      keras.layers.BatchNormalization(center=params.batchnorm_center, scale=params.batchnorm_scale, epsilon=params.batchnorm_epsilon),
-      keras.layers.ReLU(max_value=6.0),
-    ]
-
-  layers = [
-      keras.layers.Input(shape=(int((params.patch_window_seconds + params.stft_window_seconds - params.stft_hop_seconds) * params.sample_rate),), dtype='float32'),
-
-    WaveformToLogMel(params),
-    keras.layers.Reshape((params.patch_frames, params.patch_bands, 1)),
-
-    keras.layers.Conv2D(filters=32, kernel_size=[3, 3], strides=2, padding=params.conv_padding, use_bias=False),
-    keras.layers.BatchNormalization(center=params.batchnorm_center, scale=params.batchnorm_scale, epsilon=params.batchnorm_epsilon),
-    keras.layers.ReLU(max_value=6.0),
-  ]
-
-  for (filters, kernel_size, strides) in blocks:
-    layers += _build_block(filters, kernel_size, strides)
-
-  # Pooling after the conv layers
-  layers.append(
-    keras.layers.GlobalAveragePooling2D(),
-  )
-
-  # Fully connected layers
-  for units in dense_units:
-    layers += [
-      keras.layers.Dense(units=units, activation='relu', use_bias=False,
-                         kernel_regularizer=keras.regularizers.l2(1e-4)),
-      keras.layers.BatchNormalization(center=True, scale=True, epsilon=params.batchnorm_epsilon),
-      keras.layers.Dropout(0.3),
-    ]
-
-  # Classifier layer
-  layers.append(
-    keras.layers.Dense(units=params.num_classes, use_bias=True, activation=params.classifier_activation)
-  )
-
-  model = keras.Sequential(name='YAMNET-MINI', layers=layers)
-  return model
-
-
 
 block_configs = [
   # # Full
@@ -191,27 +143,27 @@ for (blocks, dense_units, eval) in evals:
 exit()
 
 # Create a quantization-aware version of the trained model
-from microesc.classification.Yamnet import WaveformToLogMel
-def apply_quantization(layer: keras.layers.Layer):
-  if not isinstance(layer, WaveformToLogMel):
-    return tfmot.quantization.keras.quantize_annotate_layer(layer)
-  return layer
-quant_model = keras.models.clone_model(model, clone_function=apply_quantization)
-with tfmot.quantization.keras.quantize_scope({'WaveformToLogMel': WaveformToLogMel}):
-  quant_model: keras.Model = tfmot.quantization.keras.quantize_apply(quant_model)
-quant_model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-4),  # type: ignore
-                    loss=keras.losses.SparseCategoricalCrossentropy(),
-                    metrics=[keras.metrics.SparseCategoricalAccuracy()])
-quant_model.summary()
+# from microesc.classification.Yamnet import WaveformToLogMel
+# def apply_quantization(layer: keras.layers.Layer):
+#   if not isinstance(layer, WaveformToLogMel):
+#     return tfmot.quantization.keras.quantize_annotate_layer(layer)
+#   return layer
+# quant_model = keras.models.clone_model(model, clone_function=apply_quantization)
+# with tfmot.quantization.keras.quantize_scope({'WaveformToLogMel': WaveformToLogMel}):
+#   quant_model: keras.Model = tfmot.quantization.keras.quantize_apply(quant_model)
+# quant_model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-4),  # type: ignore
+#                     loss=keras.losses.SparseCategoricalCrossentropy(),
+#                     metrics=[keras.metrics.SparseCategoricalAccuracy()])
+# quant_model.summary()
 
-# Carry out quantization-aware training for better quantized model accuracy
-callback = keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
-history = quant_model.fit(train_ds, epochs=10000, validation_data=test_ds, callbacks=[callback], verbose=2)  # type: ignore
-quant_model.evaluate(test_ds, return_dict=True)
-tools.plot_training_history(history)
-tools.plot_confusion_matrix(quant_model, test_ds, dataset.idx_to_label)
-quant_model.save('yamnetmini-quant-aware.keras')
+# # Carry out quantization-aware training for better quantized model accuracy
+# callback = keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+# history = quant_model.fit(train_ds, epochs=10000, validation_data=test_ds, callbacks=[callback], verbose=2)  # type: ignore
+# quant_model.evaluate(test_ds, return_dict=True)
+# tools.plot_training_history(history)
+# tools.plot_confusion_matrix(quant_model, test_ds, dataset.idx_to_label)
+# quant_model.save('yamnetmini-quant-aware.keras')
 
-# Convert the quantized model to quantized TFLite format
-tools.convert_keras_to_tflite(quant_model, 'yamnetmini.tflite', True)
-print(f"Quantized TFLite model accuracy: {tools.test_tflite_model('yamnetmini.tflite', test_ds)}")
+# # Convert the quantized model to quantized TFLite format
+# tools.convert_keras_to_tflite(quant_model, 'yamnetmini.tflite', True)
+# print(f"Quantized TFLite model accuracy: {tools.test_tflite_model('yamnetmini.tflite', test_ds)}")
