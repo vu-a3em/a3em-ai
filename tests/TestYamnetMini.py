@@ -99,14 +99,14 @@ block_configs = [
   #   (256, [3, 3], 1),
   #   (512, [3, 3], 2),
   # ],
-  # Smaller
-  [
-    (64, [3, 3], 1),
-    (128, [3, 3], 2),
-    (128, [3, 3], 1),
-    (256, [3, 3], 2),
-    (256, [3, 3], 1),
-  ],
+  # # Smaller
+  # [
+  #   (64, [3, 3], 1),
+  #   (128, [3, 3], 2),
+  #   (128, [3, 3], 1),
+  #   (256, [3, 3], 2),
+  #   (256, [3, 3], 1),
+  # ],
   # Even smaller
   [
     (64, [3, 3], 1),
@@ -155,7 +155,15 @@ dataset.summary()
 for (blocks, dense_units) in configs:
   print(f"Testing Yamnet-Mini with blocks={blocks} and dense_units={dense_units}")
   model = build_mini_yamnet_model(params, blocks=blocks, dense_units=dense_units)
-  model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-4),  # type: ignore
+  # Learning rate schedule: reduce LR on plateau
+  lr_schedule = keras.callbacks.ReduceLROnPlateau(
+      monitor='val_loss',
+      factor=0.5,
+      patience=5,
+      min_lr=1e-7,
+      verbose=1
+  )
+  model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-4),  
                 loss=keras.losses.SparseCategoricalCrossentropy(),
                 metrics=[keras.metrics.SparseCategoricalAccuracy()])
   model.summary()
@@ -163,7 +171,13 @@ for (blocks, dense_units) in configs:
 
   # Train and save the best model
   callback = keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
-  history: keras.callbacks.History = model.fit(train_ds, epochs=10000, validation_data=test_ds, callbacks=[callback], verbose=2)  # type: ignore
+  history: keras.callbacks.History = model.fit(
+      train_ds,
+      epochs=10000,
+      validation_data=test_ds,
+      callbacks=[callback, lr_schedule],
+      verbose=2
+  )  # type: ignore
   val_eval = model.evaluate(test_ds, return_dict=True)
   evals.append((blocks, dense_units, val_eval))
   #tools.plot_training_history(history)
