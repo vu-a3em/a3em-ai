@@ -11,7 +11,12 @@ import numpy as np
 
 from microesc.classification.yamnetmini import build_mini_yamnet_model
 
-ignore_dirs = ['Gunshot',  'Fireworks', 'Drums', 'Engine', 'Noise']
+#set seed for reproducibility
+tf.random.set_seed(42)
+np.random.seed(42)
+
+# ignore_dirs = ['Gunshot',  'Fireworks', 'Drums', 'Engine', 'Noise']
+ignore_dirs = ['Gunshot']
 
 # Generate the Yamnet model
 params = YamnetParams()
