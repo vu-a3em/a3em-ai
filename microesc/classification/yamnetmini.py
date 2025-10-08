@@ -6,10 +6,10 @@ def build_mini_yamnet_model(params: YamnetParams, blocks , dense_units) -> keras
   def _build_block(filters: int, kernel_size: list, strides: int) -> list[keras.layers.Layer]:
     return [
       keras.layers.DepthwiseConv2D(kernel_size=kernel_size, strides=strides, depth_multiplier=1, padding=params.conv_padding, use_bias=False),
-      keras.layers.BatchNormalization(center=params.batchnorm_center, scale=params.batchnorm_scale, epsilon=params.batchnorm_epsilon),
+      keras.layers.GroupNormalization(groups=8, axis=-1, epsilon=params.batchnorm_epsilon),
       keras.layers.ReLU(max_value=6.0),
       keras.layers.Conv2D(filters=filters, kernel_size=[1, 1], strides=1, padding=params.conv_padding, use_bias=False),
-      keras.layers.BatchNormalization(center=params.batchnorm_center, scale=params.batchnorm_scale, epsilon=params.batchnorm_epsilon),
+      keras.layers.GroupNormalization(groups=8, axis=-1, epsilon=params.batchnorm_epsilon),
       keras.layers.ReLU(max_value=6.0),
     ]
 
@@ -20,7 +20,7 @@ def build_mini_yamnet_model(params: YamnetParams, blocks , dense_units) -> keras
     keras.layers.Reshape((params.patch_frames, params.patch_bands, 1)),
 
     keras.layers.Conv2D(filters=32, kernel_size=[3, 3], strides=2, padding=params.conv_padding, use_bias=False),
-    keras.layers.BatchNormalization(center=params.batchnorm_center, scale=params.batchnorm_scale, epsilon=params.batchnorm_epsilon),
+    keras.layers.GroupNormalization(groups=8, axis=-1, epsilon=params.batchnorm_epsilon),
     keras.layers.ReLU(max_value=6.0),
   ]
 
