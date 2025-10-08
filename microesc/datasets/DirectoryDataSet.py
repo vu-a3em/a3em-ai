@@ -7,8 +7,13 @@ import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 class AudioClip:
-
+  """
+  Represents a labelled audio clip loaded from a file, with start time and optional end time to represent a segment of the file.
+  """
   class AudioData:
+    """
+    Stores audio clip data and loads from file on demand using a context manager.
+    """
 
     def __init__(self, path: str, start_seconds: float, end_seconds: float | None, sample_rate: int):
       self.path = path
@@ -50,6 +55,9 @@ class AudioClip:
 
 
 class KerasDataSet(PyDataset):
+  """
+  A tf.data.Dataset that loads audio clips from files on demand.
+  """
 
   def __init__(self, dataset: List[AudioClip], batch_size: int | None, **kwargs):
     super().__init__(**kwargs)
@@ -78,6 +86,10 @@ class KerasDataSet(PyDataset):
 
 
 def _process_audio_file(args):
+  """
+  Processes a single audio file to extract AudioClip instances based on event detection or fixed-length segments.
+  Used with ThreadPoolExecutor for parallel processing.
+  """
   file, idx, label, target_sample_rate_hz, target_clip_length, event_start_offset, event_detector, event_detector_match_metadata_leeway_seconds, parse_metadata_func = args
   clips = []
   try:
@@ -114,6 +126,9 @@ def _process_audio_file(args):
   return clips
 
 class DirectoryDataSet:
+  """
+  Loads audio clips from a directory structure where each subdirectory represents a class label (sub-subdirectories are flattened).
+  """
 
   def __init__(self,
                base_path: str,
@@ -193,6 +208,9 @@ class DirectoryDataSet:
     return metadata
 
   def summary(self):
+    """
+    Prints a summary of the dataset including total clips, training/test split, and label counts.
+    """
     print("\n\033[1mDataset summary:\033[0m")
     print(f"   \033[1mTotal clips:\033[0m {len(self.clips)}")
     print(f"   \033[1mTraining clips:\033[0m {len(self.training_clips)}")

@@ -1,5 +1,6 @@
 import os
 from microesc.datasets.DirectoryDataSet import DirectoryDataSet
+from microesc.datasets.AugmentedDirectoryDataSet import AugmentedDirectoryDataSet
 from microesc.classification.Yamnet import create_yamnet_model, YamnetParams, WaveformToLogMel
 from microesc.detection.SpectralFluxDetector import SpectralFluxDetector
 from microesc import keras
@@ -16,7 +17,10 @@ tf.random.set_seed(42)
 np.random.seed(42)
 
 # ignore_dirs = ['Gunshot',  'Fireworks', 'Drums', 'Engine', 'Noise']
-ignore_dirs = ['Gunshot']
+# For now, ignoring classes with way too many or too few samples
+ignore_dirs = ['Gunshot', 'Whistle']
+
+background_classes = ['Noise', 'VehicleExhaust', 'Wind']
 
 # Generate the Yamnet model
 params = YamnetParams()
@@ -88,7 +92,19 @@ evals = []
 dataset_path = '/isis/home/steing/AIDataSet'
 event_detector = SpectralFluxDetector(9.0, 8000, 512, 256, False, 150.0, 1800.0, 0.100)
 
-dataset = DirectoryDataSet(dataset_path, params.sample_rate, params.patch_window_seconds + params.stft_window_seconds - params.stft_hop_seconds, 0.8, False, 0.3, event_detector, 0.1, ignore_directories=ignore_dirs)
+dataset = AugmentedDirectoryDataSet(
+    dataset_path, 
+    params.sample_rate,
+    params.patch_window_seconds + params.stft_window_seconds - params.stft_hop_seconds, 
+    0.8,
+    False,
+    0.3,
+    event_detector,
+    0.1,
+    ignore_directories=ignore_dirs,
+    background_classes=background_classes,
+    background_to_event_ratio=[0.01, 0.3],
+)
 
 batch_size = 16
 train_ds = dataset.train_dataset(batch_size=batch_size)
