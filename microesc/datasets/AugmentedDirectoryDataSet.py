@@ -120,7 +120,8 @@ class AugmentedDirectoryDataSet:
                event_detector_match_metadata_leeway_seconds: float | None = None,
                ignore_directories: List[str] = [],
                background_classes: List[str] = [],
-               background_to_event_ratio: float | List[float] = 0.0
+               background_to_event_ratio: float | List[float] = 0.0,
+               max_samples_per_class: int | None = None,
                ):
 
 
@@ -152,13 +153,17 @@ class AugmentedDirectoryDataSet:
             self.labels.add(label)
             self.label_to_idx[label] = idx
             self.idx_to_label[idx] = label
+
+            dir_files = []
             for file in glob.glob(os.path.join(dir, '**'), recursive=True):
                 if file.lower().endswith(('.wav', '.mp3', '.ogg', '.m4a', '.aac')):
-                    files_to_process.append((
+                    dir_files.append((
                         file, idx, label, target_sample_rate_hz, target_clip_length,
                         event_start_offset, event_detector, event_detector_match_metadata_leeway_seconds,
                         self._parse_metadata
                     ))
+            
+            files_to_process.extend(dir_files)
             idx += 1
 
         # Parallel processing using ThreadPoolExecutor
@@ -171,6 +176,17 @@ class AugmentedDirectoryDataSet:
                     else:
                         self.clips.append(clip)
                         self.label_counts[clip.label] += 1
+
+        # Limit number of samples per class if specified
+        if max_samples_per_class:
+            new_clips = []
+            for label in self.labels:
+                label_clips = [c for c in self.clips if c.label == label]
+                if len(label_clips) > max_samples_per_class:
+                    label_clips = random.sample(label_clips, max_samples_per_class)
+                new_clips.extend(label_clips)
+                self.label_counts[label] = len(label_clips)
+            self.clips = new_clips
 
         # Augment dataset if uniform classes per batch is requested
         if uniform_classes_per_batch:

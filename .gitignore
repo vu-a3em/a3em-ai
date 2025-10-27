@@ -183,3 +183,5 @@ __marimo__/
 yamnet*.keras
 yamnetmini*.keras
 yamnet_adapter*.keras
+*confusion_matrix*.png
+*training_history*.png
