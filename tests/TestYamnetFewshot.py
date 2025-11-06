@@ -18,8 +18,11 @@ if 'SEED' in os.environ:
   seed = int(os.environ['SEED'])
 else:
   seed = 42
+
 tf.random.set_seed(seed)
 np.random.seed(seed)
+
+seed = -1
 
 # ignore_dirs = ['Gunshot',  'Fireworks', 'Drums', 'Engine', 'Noise']
 # For now, ignoring classes with way too many or too few samples
@@ -104,6 +107,15 @@ all_classes = [d for d in all_classes if d not in ignore_dirs and d not in backg
 # Pick N random classes for few-shot learning
 N = 5
 selected_classes = np.random.choice(all_classes, N, replace=False).tolist()
+
+selected_classes = [
+  'ElephantRumble',
+  'Rumination',
+  'Cow',
+  'Dog',
+  'Rooster',
+]
+
 print(f"Selected classes for few-shot learning: {selected_classes}")
 
 # Train without selected classes to simulate few-shot learning
@@ -206,12 +218,16 @@ dataset = AugmentedDirectoryDataSet(
     background_classes=background_classes,
     background_to_event_ratio=[0.01, 0.3],
     max_samples_per_class=100,  # Limit to 100 samples per class for few-shot, will be up to 20 per class in training set (20-80 split)
+    use_metadata=True,
 )
 
 batch_size = 16
 train_ds = dataset.train_dataset(batch_size=batch_size)
 test_ds = dataset.test_dataset(batch_size=batch_size)
 dataset.summary()
+
+train_ds.summary()
+test_ds.summary()
 
 # Precompute and rebuild datasets
 X_train, y_train = generate_embedding_dataset(train_ds)

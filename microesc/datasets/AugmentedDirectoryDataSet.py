@@ -12,12 +12,13 @@ class KerasDataSet(PyDataset):
   A tf.data.Dataset that loads audio clips from files on demand.
   """
 
-  def __init__(self, dataset: List[AudioClip], batch_size: int | None, background_clips: List[AudioClip] = None, background_to_event_ratio: float = 0.0, **kwargs):
+  def __init__(self, dataset: List[AudioClip], batch_size: int | None, background_clips: List[AudioClip] = None, background_to_event_ratio: float = 0.0, expected_samples: int = None,  **kwargs):
     super().__init__(**kwargs)
     self.batch_size = batch_size if batch_size is not None else 32
     self.dataset = dataset
     self.background_clips = background_clips if background_clips is not None else []
     self.background_to_event_ratio = background_to_event_ratio
+    self.expected_samples = expected_samples
 
   def __len__(self) -> int:
     return math.ceil(len(self.dataset) / self.batch_size)
@@ -57,19 +58,40 @@ class KerasDataSet(PyDataset):
             # Mix event and background audio
             event_data = event_data * (1 - ratio) + bg_data * ratio
 
+        if self.expected_samples and len(event_data) < self.expected_samples:
+          print(f"Padding audio from {len(event_data)} to expected {self.expected_samples} samples.")
+          event_data = np.pad(event_data, (0, self.expected_samples - len(event_data)), mode='constant')
+
         batch_data.append(event_data)
         batch_labels.append(clip.label_idx)
-    return np.array(batch_data), np.array(batch_labels)
+    try:
+        return np.array(batch_data), np.array(batch_labels)
+    except Exception as e:
+        print(f"Error converting batch data to numpy arrays: {e}")
+        print(f"Batch data lengths: {[len(d) for d in batch_data]}")
+        print(f"Batch label lengths: {[l for l in batch_labels]}")
+        raise e
 
   def on_epoch_end(self):
     random.shuffle(self.dataset)
+
+  def summary(self):
+    """
+    Prints a summary of the dataset including total clips and batch size.
+    """
+    print("\n\033[1mKerasDataSet summary:\033[0m")
+    print(f"   \033[1mTotal clips:\033[0m {len(self.dataset)}")
+    print(f"   \033[1mBatch size:\033[0m {self.batch_size}")
+    if self.background_clips:
+      print(f"   \033[1mBackground clips:\033[0m {len(self.background_clips)}")
+      print(f"   \033[1mBackground to event ratio:\033[0m {self.background_to_event_ratio}")
 
 def _process_audio_file(args):
   """
   Processes a single audio file to extract AudioClip instances based on event detection or fixed-length segments.
   Used with ThreadPoolExecutor for parallel processing.
   """
-  file, idx, label, target_sample_rate_hz, target_clip_length, event_start_offset, event_detector, event_detector_match_metadata_leeway_seconds, parse_metadata_func = args
+  file, idx, label, target_sample_rate_hz, target_clip_length, event_start_offset, event_detector, event_detector_match_metadata_leeway_seconds, use_metadata, parse_metadata_func = args
   clips = []
   try:
     audio_length_seconds = librosa.get_duration(path=file)
@@ -79,27 +101,36 @@ def _process_audio_file(args):
       if os.path.exists(metadata_file):
         metadata = parse_metadata_func(metadata_file)
 
-    if event_detector:
-      for event_onset in event_detector.detect_events(file):
-        if not metadata or np.isclose(metadata, event_onset, atol=event_detector_match_metadata_leeway_seconds).any():
-          event_onset -= event_start_offset
-          event_end_time = (event_onset + target_clip_length) if target_clip_length else None
-          if event_onset >= 0.0 and (not event_end_time or event_end_time <= audio_length_seconds):
-            clips.append(AudioClip(idx, label, file, event_onset, event_end_time, target_sample_rate_hz))
-    elif target_clip_length:
-      if metadata:
-        for start_time in metadata:
-          event_onset = start_time - event_start_offset
-          event_end_time = event_onset + target_clip_length
-          if event_onset >= 0.0 and event_end_time <= audio_length_seconds:
-            clips.append(AudioClip(idx, label, file, event_onset, event_end_time, target_sample_rate_hz))
-      else:
-        for start_time in np.arange(0, audio_length_seconds, target_clip_length):
-          event_end_time = start_time + target_clip_length
-          if event_end_time <= audio_length_seconds:
-            clips.append(AudioClip(idx, label, file, start_time, event_end_time, target_sample_rate_hz))
+    # Use the clipping from the metadata if requested
+    if use_metadata and metadata:
+      for start_time in metadata:
+        event_onset = start_time - event_start_offset
+        event_end_time = event_onset + target_clip_length if target_clip_length else None
+
+        if event_onset >= 0.0 and (not event_end_time or event_end_time <= audio_length_seconds):
+          clips.append(AudioClip(idx, label, file, event_onset, event_end_time, target_sample_rate_hz))
     else:
-      clips.append(AudioClip(idx, label, file, 0.0, target_clip_length, target_sample_rate_hz))
+      if event_detector:
+        for event_onset in event_detector.detect_events(file):
+          if not metadata or np.isclose(metadata, event_onset, atol=event_detector_match_metadata_leeway_seconds).any():
+            event_onset -= event_start_offset
+            event_end_time = (event_onset + target_clip_length) if target_clip_length else None
+            if event_onset >= 0.0 and (not event_end_time or event_end_time <= audio_length_seconds):
+              clips.append(AudioClip(idx, label, file, event_onset, event_end_time, target_sample_rate_hz))
+      elif target_clip_length:
+        if metadata:
+          for start_time in metadata:
+            event_onset = start_time - event_start_offset
+            event_end_time = event_onset + target_clip_length
+            if event_onset >= 0.0 and event_end_time <= audio_length_seconds:
+              clips.append(AudioClip(idx, label, file, event_onset, event_end_time, target_sample_rate_hz))
+        else:
+          for start_time in np.arange(0, audio_length_seconds, target_clip_length):
+            event_end_time = start_time + target_clip_length
+            if event_end_time <= audio_length_seconds:
+              clips.append(AudioClip(idx, label, file, start_time, event_end_time, target_sample_rate_hz))
+      else:
+        clips.append(AudioClip(idx, label, file, 0.0, target_clip_length, target_sample_rate_hz))
   except Exception as e:
     print(f"Error processing {file}: {e}")
   return clips
@@ -122,6 +153,7 @@ class AugmentedDirectoryDataSet:
                background_classes: List[str] = [],
                background_to_event_ratio: float | List[float] = 0.0,
                max_samples_per_class: int | None = None,
+               use_metadata: bool = False,
                ):
 
 
@@ -131,6 +163,7 @@ class AugmentedDirectoryDataSet:
         self.background_clips = []
         
         self.background_to_event_ratio = background_to_event_ratio
+        self.expected_samples = int(target_clip_length * target_sample_rate_hz) if target_clip_length else None
 
         files_to_process = []
         idx = 0
@@ -146,7 +179,7 @@ class AugmentedDirectoryDataSet:
                         files_to_process.append((
                             file, None, label, target_sample_rate_hz, target_clip_length,
                             event_start_offset, event_detector, event_detector_match_metadata_leeway_seconds,
-                            self._parse_metadata
+                            use_metadata, self._parse_metadata
                         ))
                 continue  # Do not add background labels to main label structures
 
@@ -160,6 +193,7 @@ class AugmentedDirectoryDataSet:
                     dir_files.append((
                         file, idx, label, target_sample_rate_hz, target_clip_length,
                         event_start_offset, event_detector, event_detector_match_metadata_leeway_seconds,
+                        use_metadata,
                         self._parse_metadata
                     ))
             
@@ -234,7 +268,7 @@ class AugmentedDirectoryDataSet:
     print()
 
   def train_dataset(self, batch_size: int | None = None, **kwargs) -> KerasDataSet:
-    return KerasDataSet(self.training_clips, batch_size, background_clips=self.background_clips, background_to_event_ratio=self.background_to_event_ratio, **kwargs)
+    return KerasDataSet(self.training_clips, batch_size, background_clips=self.background_clips, background_to_event_ratio=self.background_to_event_ratio, expected_samples=self.expected_samples, **kwargs)
 
   def test_dataset(self, batch_size: int | None = None, **kwargs) -> KerasDataSet:
-    return KerasDataSet(self.test_clips, batch_size, background_clips=self.background_clips, background_to_event_ratio=self.background_to_event_ratio, **kwargs)
+    return KerasDataSet(self.test_clips, batch_size, background_clips=self.background_clips, background_to_event_ratio=self.background_to_event_ratio, expected_samples=self.expected_samples, **kwargs)
