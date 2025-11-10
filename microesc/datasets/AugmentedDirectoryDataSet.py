@@ -59,7 +59,7 @@ class KerasDataSet(PyDataset):
             event_data = event_data * (1 - ratio) + bg_data * ratio
 
         if self.expected_samples and len(event_data) < self.expected_samples:
-          print(f"Padding audio from {len(event_data)} to expected {self.expected_samples} samples.")
+          # print(f"Padding audio from {len(event_data)} to expected {self.expected_samples} samples.")
           event_data = np.pad(event_data, (0, self.expected_samples - len(event_data)), mode='constant')
 
         batch_data.append(event_data)
@@ -138,6 +138,7 @@ def _process_audio_file(args):
 class AugmentedDirectoryDataSet:
   """
   Loads audio clips from a directory structure where each subdirectory represents a class label (sub-subdirectories are flattened).
+  Supports adding additional labeled or background clips after initialization.
   """
 
   def __init__(self,
@@ -156,12 +157,15 @@ class AugmentedDirectoryDataSet:
                use_metadata: bool = False,
                ):
 
+        self.training_split_percent = training_split_percent
+        self.uniform_classes_per_batch = uniform_classes_per_batch
+        self.max_samples_per_class = max_samples_per_class
 
         # Create structures to hold audio clips and labels
         self.clips, self.labels, self.label_counts = [], set(), defaultdict(int)
         self.label_to_idx, self.idx_to_label = {}, {}
         self.background_clips = []
-        
+
         self.background_to_event_ratio = background_to_event_ratio
         self.expected_samples = int(target_clip_length * target_sample_rate_hz) if target_clip_length else None
 
@@ -196,7 +200,7 @@ class AugmentedDirectoryDataSet:
                         use_metadata,
                         self._parse_metadata
                     ))
-            
+
             files_to_process.extend(dir_files)
             idx += 1
 
@@ -208,36 +212,18 @@ class AugmentedDirectoryDataSet:
                     if clip.label in background_classes:
                         self.background_clips.append(clip)
                     else:
-                        self.clips.append(clip)
-                        self.label_counts[clip.label] += 1
+                        self._add_clip_internal(clip)
 
         # Limit number of samples per class if specified
-        if max_samples_per_class:
-            new_clips = []
-            for label in self.labels:
-                label_clips = [c for c in self.clips if c.label == label]
-                if len(label_clips) > max_samples_per_class:
-                    label_clips = random.sample(label_clips, max_samples_per_class)
-                new_clips.extend(label_clips)
-                self.label_counts[label] = len(label_clips)
-            self.clips = new_clips
+        if self.max_samples_per_class:
+            self._apply_max_samples_per_class()
 
         # Augment dataset if uniform classes per batch is requested
-        if uniform_classes_per_batch:
-            max_count = max(self.label_counts.values())
-            for label, count in self.label_counts.items():
-                if count < max_count:
-                    for _ in range(max_count - count):
-                        clip = random.choice([c for c in self.clips if c.label == label])
-                        new_start_time = max(0, random.uniform(clip.audio.start_time - 0.150, clip.audio.start_time + 0.150))
-                        new_end_time = new_start_time + (clip.audio.end_time - clip.audio.start_time) if clip.audio.end_time else None
-                        self.clips.append(AudioClip(clip.label_idx, clip.label, clip.audio.path, new_start_time, new_end_time, clip.audio.sample_rate))
-                        self.label_counts[label] += 1
+        if self.uniform_classes_per_batch:
+            self._augment_uniform_classes()
 
-        # Shuffle the clips and split them into a training and test set
-        random.shuffle(self.clips)
-        self.training_clips = self.clips[:int(len(self.clips) * training_split_percent)]
-        self.test_clips = self.clips[int(len(self.clips) * training_split_percent):]
+        # Initial split
+        self._split_train_test()
 
   def __len__(self) -> int:
     return len(self.clips)
@@ -272,3 +258,193 @@ class AugmentedDirectoryDataSet:
 
   def test_dataset(self, batch_size: int | None = None, **kwargs) -> KerasDataSet:
     return KerasDataSet(self.test_clips, batch_size, background_clips=self.background_clips, background_to_event_ratio=self.background_to_event_ratio, expected_samples=self.expected_samples, **kwargs)
+
+  def _add_clip_internal(self, clip: AudioClip) -> None:
+    """Internal helper to register a non-background clip and update counts and label indices."""
+    # Ensure mapping exists for this label
+    if clip.label not in self.label_to_idx:
+      new_idx = len(self.label_to_idx)
+      self.label_to_idx[clip.label] = new_idx
+      self.idx_to_label[new_idx] = clip.label
+      self.labels.add(clip.label)
+    # Normalize label_idx
+    clip.label_idx = self.label_to_idx[clip.label]
+    self.clips.append(clip)
+    self.label_counts[clip.label] += 1
+
+  def _split_train_test(self) -> None:
+    """Create or refresh training/test split from current clips."""
+    if not self.clips:
+      self.training_clips, self.test_clips = [], []
+      return
+    random.shuffle(self.clips)
+    split_idx = int(len(self.clips) * self.training_split_percent)
+    self.training_clips = self.clips[:split_idx]
+    self.test_clips = self.clips[split_idx:]
+
+  def _apply_max_samples_per_class(self) -> None:
+    """Limit samples per class according to self.max_samples_per_class."""
+    if not self.max_samples_per_class:
+      return
+    new_clips = []
+    new_counts = defaultdict(int)
+    for label in self.labels:
+      label_clips = [c for c in self.clips if c.label == label]
+      if len(label_clips) > self.max_samples_per_class:
+        label_clips = random.sample(label_clips, self.max_samples_per_class)
+      new_clips.extend(label_clips)
+      new_counts[label] = len(label_clips)
+    self.clips = new_clips
+    self.label_counts = new_counts
+
+  def _augment_uniform_classes(self) -> None:
+    """Upsample classes so each has the same number of samples as the largest class."""
+    if not self.label_counts:
+      return
+    max_count = max(self.label_counts.values())
+    for label, count in list(self.label_counts.items()):
+      if count < max_count:
+        candidates = [c for c in self.clips if c.label == label]
+        if not candidates:
+          continue
+        needed = max_count - count
+        for _ in range(needed):
+          base = random.choice(candidates)
+          original = base.audio
+          length = (original.end_time - original.start_time) if original.end_time else 0.0
+          if length <= 0.0:
+            aug = AudioClip(base.label_idx, base.label, original.path, original.start_time, original.end_time, original.sample_rate)
+          else:
+            shift = random.uniform(-0.150, 0.150)
+            new_start = max(0.0, original.start_time + shift)
+            new_end = new_start + length
+            aug = AudioClip(base.label_idx, base.label, original.path, new_start, new_end, original.sample_rate)
+          self.clips.append(aug)
+          self.label_counts[label] += 1
+
+  # Public API: incremental updates
+
+  def add_clips_for_label(self, label: str, clips: List[AudioClip], *, is_background: bool = False, resplit: bool = True) -> None:
+    """
+    Add pre-constructed AudioClip instances for a given label.
+    - If is_background is True, clips are added to background_clips only.
+    - Otherwise, label is treated as a normal class label (created if needed).
+    Generic enough for "Other" or any other label.
+    """
+    if is_background:
+      self.background_clips.extend(clips)
+      return
+
+    # Ensure label index exists
+    if label not in self.label_to_idx:
+      new_idx = len(self.label_to_idx)
+      self.label_to_idx[label] = new_idx
+      self.idx_to_label[new_idx] = label
+      self.labels.add(label)
+
+    for clip in clips:
+      clip.label = label
+      clip.label_idx = self.label_to_idx[label]
+      self._add_clip_internal(clip)
+
+    if self.max_samples_per_class:
+      self._apply_max_samples_per_class()
+
+    if self.uniform_classes_per_batch:
+      self._augment_uniform_classes()
+
+    if resplit:
+      self._split_train_test()
+
+  def add_class_from_directory(self,
+                               label: str,
+                               path: str,
+                               target_sample_rate_hz: int,
+                               target_clip_length: float | None,
+                               event_start_offset: float = 0.0,
+                               event_detector: EventDetector | None = None,
+                               event_detector_match_metadata_leeway_seconds: float | None = None,
+                               use_metadata: bool = False,
+                               resplit: bool = True) -> None:
+    """
+    Scan a directory (recursively) and add all matching audio clips as a new or existing label.
+    Generic utility; can be used to add an "Other" class after initialization.
+    """
+    # Ensure label index exists
+    if label not in self.label_to_idx:
+      new_idx = len(self.label_to_idx)
+      self.label_to_idx[label] = new_idx
+      self.idx_to_label[new_idx] = label
+      self.labels.add(label)
+
+    files_to_process = []
+    for file in glob.glob(os.path.join(os.path.abspath(path), '**'), recursive=True):
+      if file.lower().endswith(('.wav', '.mp3', '.ogg', '.m4a', '.aac')):
+        files_to_process.append((
+          file,
+          self.label_to_idx[label],
+          label,
+          target_sample_rate_hz,
+          target_clip_length,
+          event_start_offset,
+          event_detector,
+          event_detector_match_metadata_leeway_seconds,
+          use_metadata,
+          self._parse_metadata,
+        ))
+
+    if not files_to_process:
+      return
+
+    with ThreadPoolExecutor() as executor:
+      futures = [executor.submit(_process_audio_file, args) for args in files_to_process]
+      for future in as_completed(futures):
+        for clip in future.result():
+          self._add_clip_internal(clip)
+
+    if self.max_samples_per_class:
+      self._apply_max_samples_per_class()
+
+    if self.uniform_classes_per_batch:
+      self._augment_uniform_classes()
+
+    if resplit:
+      self._split_train_test()
+
+  def add_background_from_directory(self,
+                                    path: str,
+                                    target_sample_rate_hz: int,
+                                    target_clip_length: float | None,
+                                    event_start_offset: float = 0.0,
+                                    event_detector: EventDetector | None = None,
+                                    event_detector_match_metadata_leeway_seconds: float | None = None,
+                                    use_metadata: bool = False) -> None:
+    """
+    Add additional background-only clips from a directory.
+    These clips are only used for mixing (not as a predicted class).
+    """
+    files_to_process = []
+    dummy_label = "__background__"
+    for file in glob.glob(os.path.join(os.path.abspath(path), '**'), recursive=True):
+      if file.lower().endswith(('.wav', '.mp3', '.ogg', '.m4a', '.aac')):
+        files_to_process.append((
+          file,
+          None,
+          dummy_label,
+          target_sample_rate_hz,
+          target_clip_length,
+          event_start_offset,
+          event_detector,
+          event_detector_match_metadata_leeway_seconds,
+          use_metadata,
+          self._parse_metadata,
+        ))
+
+    if not files_to_process:
+      return
+
+    with ThreadPoolExecutor() as executor:
+      futures = [executor.submit(_process_audio_file, args) for args in files_to_process]
+      for future in as_completed(futures):
+        for clip in future.result():
+          self.background_clips.append(clip)
