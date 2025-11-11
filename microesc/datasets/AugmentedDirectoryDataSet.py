@@ -365,10 +365,14 @@ class AugmentedDirectoryDataSet:
                                event_detector: EventDetector | None = None,
                                event_detector_match_metadata_leeway_seconds: float | None = None,
                                use_metadata: bool = False,
+                               max_samples: int | None = None,
                                resplit: bool = True) -> None:
     """
     Scan a directory (recursively) and add all matching audio clips as a new or existing label.
     Generic utility; can be used to add an "Other" class after initialization.
+
+    max_samples (optional): if provided, randomly subsample at most this many
+    source files before processing into AudioClip instances.
     """
     # Ensure label index exists
     if label not in self.label_to_idx:
@@ -377,25 +381,36 @@ class AugmentedDirectoryDataSet:
       self.idx_to_label[new_idx] = label
       self.labels.add(label)
 
-    files_to_process = []
-    for file in glob.glob(os.path.join(os.path.abspath(path), '**'), recursive=True):
-      if file.lower().endswith(('.wav', '.mp3', '.ogg', '.m4a', '.aac')):
-        files_to_process.append((
-          file,
-          self.label_to_idx[label],
-          label,
-          target_sample_rate_hz,
-          target_clip_length,
-          event_start_offset,
-          event_detector,
-          event_detector_match_metadata_leeway_seconds,
-          use_metadata,
-          self._parse_metadata,
-        ))
-
-    if not files_to_process:
+    # Collect all candidate audio files
+    all_files = [
+      file for file in glob.glob(os.path.join(os.path.abspath(path), '**'), recursive=True)
+      if file.lower().endswith(('.wav', '.mp3', '.ogg', '.m4a', '.aac'))
+    ]
+    if not all_files:
       return
 
+    # Optionally subsample sources
+    if max_samples is not None and len(all_files) > max_samples:
+      all_files = random.sample(all_files, max_samples)
+
+    # Build args for processing
+    files_to_process = [
+      (
+        file,
+        self.label_to_idx[label],
+        label,
+        target_sample_rate_hz,
+        target_clip_length,
+        event_start_offset,
+        event_detector,
+        event_detector_match_metadata_leeway_seconds,
+        use_metadata,
+        self._parse_metadata,
+      )
+      for file in all_files
+    ]
+
+    # Parallel processing and registration
     with ThreadPoolExecutor() as executor:
       futures = [executor.submit(_process_audio_file, args) for args in files_to_process]
       for future in as_completed(futures):

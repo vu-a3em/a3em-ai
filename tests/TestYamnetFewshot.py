@@ -1,4 +1,3 @@
-
 import os
 from microesc.datasets.DirectoryDataSet import DirectoryDataSet
 from microesc.datasets.AugmentedDirectoryDataSet import AugmentedDirectoryDataSet
@@ -29,6 +28,8 @@ seed = -1
 ignore_dirs = ['Gunshot', 'Whistle']
 
 background_classes = ['Noise', 'VehicleExhaust', 'Wind']
+
+add_none_class = True
 
 # Generate the Yamnet model
 params = YamnetParams()
@@ -111,9 +112,6 @@ selected_classes = np.random.choice(all_classes, N, replace=False).tolist()
 selected_classes = [
   'ElephantRumble',
   'Rumination',
-  'Cow',
-  'Dog',
-  'Rooster',
 ]
 
 print(f"Selected classes for few-shot learning: {selected_classes}")
@@ -204,6 +202,7 @@ def generate_embedding_dataset(seq):
   return X, y
 
 print("Extracting embeddings for few-shot classes...")
+
 # Make new datasets with only the selected few-shot classes
 dataset = AugmentedDirectoryDataSet(
     dataset_path, 
@@ -217,9 +216,27 @@ dataset = AugmentedDirectoryDataSet(
     ignore_directories=[d for d in os.listdir(dataset_path) if os.path.isdir(os.path.join(dataset_path, d)) and d not in selected_classes and d not in background_classes],
     background_classes=background_classes,
     background_to_event_ratio=[0.01, 0.3],
-    max_samples_per_class=100,  # Limit to 100 samples per class for few-shot, will be up to 20 per class in training set (20-80 split)
+    max_samples_per_class=500,  # Limit to 100 samples per class for few-shot, will be up to 20 per class in training set (20-80 split)
     use_metadata=True,
 )
+
+if add_none_class:
+  # Add background classes as "None" class
+
+  # Compute max samples per background class to balance dataset
+  per_bg_class = max(dataset.label_counts.values()) // len(background_classes)
+
+  print(dataset.label_counts.values())
+  print(f"Max samples per background class: {per_bg_class}")
+
+  for bg_class in background_classes:
+    dataset.add_class_from_directory(
+        label='None',
+        path=os.path.join(dataset_path, bg_class),
+        target_sample_rate_hz=params.sample_rate,
+        target_clip_length=params.patch_window_seconds + params.stft_window_seconds - params.stft_hop_seconds,
+        max_samples=per_bg_class,
+    )
 
 batch_size = 16
 train_ds = dataset.train_dataset(batch_size=batch_size)
@@ -241,11 +258,11 @@ print(f"Extracted {X_train.shape[0]} training embeddings and {X_test.shape[0]} t
 # Create new classifier model for the extracted features
 classifier = keras.Sequential([
     keras.layers.Input(shape=model.output.shape[1:], dtype='float32'),
-    keras.layers.Dense(units=256, use_bias=True, activation='relu'),
+    keras.layers.Dense(units=256 + 64, use_bias=True, activation='relu'),
     keras.layers.Dropout(0.25),
-    keras.layers.Dense(units=128, use_bias=True, activation='relu'),
+    keras.layers.Dense(units=128 + 32, use_bias=True, activation='relu'),
     keras.layers.Dropout(0.25),
-    keras.layers.Dense(units=len(selected_classes), use_bias=True, activation=params.classifier_activation)
+    keras.layers.Dense(units=(len(selected_classes) + 1) if add_none_class else len(selected_classes), use_bias=True, activation=params.classifier_activation)
 ])
 lr_schedule = keras.callbacks.ReduceLROnPlateau(
     monitor='val_loss',
@@ -268,4 +285,112 @@ tools.plot_training_history(history, save_path=f'yamnetmini_training_history_few
 tools.plot_confusion_matrix(classifier, test_ds, dataset.idx_to_label, save_path=f'yamnetmini_confusion_matrix_fewshotclassifier_{seed}.png')
 print(f"Yamnet-Mini + classifier achieved test accuracy {val_eval['sparse_categorical_accuracy']*100:.2f}%")
 
-#classifier.save('yamnet_adapter.keras')
+# Helper: tune decision threshold to bias away from 'None' class
+
+def compute_none_bias_threshold(model, val_ds, none_idx: int, target_fpr: float = 0.10):
+  """Compute a decision threshold on (best_non_none_prob - none_prob).
+
+  - model: trained classifier (softmax probs output).
+  - val_ds: tf.data.Dataset of (X, y) for validation.
+  - none_idx: integer index of the None/background class.
+  - target_fpr: max allowed None->event false positive rate.
+
+  Returns: (best_threshold, roc_points) where roc_points is a list of (t, tpr, fpr).
+  """
+  y_true_list, y_prob_list = [], []
+  for xb, yb in val_ds:
+    probs = model(xb, training=False).numpy()
+    y_prob_list.append(probs)
+    y_true_list.append(yb.numpy())
+
+  if not y_true_list:
+    raise ValueError("Empty validation dataset passed to compute_none_bias_threshold")
+
+  y_true = np.concatenate(y_true_list)
+  y_prob = np.concatenate(y_prob_list)
+
+  num_classes = y_prob.shape[1]
+  non_none_mask = np.ones(num_classes, dtype=bool)
+  non_none_mask[none_idx] = False
+
+  best_non_none_idx = np.argmax(y_prob[:, non_none_mask], axis=1)
+  best_non_none_prob = y_prob[:, non_none_mask][np.arange(len(y_prob)), best_non_none_idx]
+  none_prob = y_prob[:, none_idx]
+  score = best_non_none_prob - none_prob
+
+  is_event_true = (y_true != none_idx)
+
+  def event_vs_none_metrics(t: float):
+    choose_event = (score >= t)
+    global_non_none_indices = np.arange(num_classes)[non_none_mask]
+    pred = np.full_like(y_true, fill_value=none_idx)
+    pred[choose_event] = global_non_none_indices[best_non_none_idx[choose_event]]
+
+    is_event_pred = (pred != none_idx)
+
+    tp = np.sum(is_event_pred & is_event_true)
+    fp = np.sum(is_event_pred & ~is_event_true)
+    fn = np.sum(~is_event_pred & is_event_true)
+    tn = np.sum(~is_event_pred & ~is_event_true)
+
+    tpr = tp / (tp + fn + 1e-9)
+    fpr = fp / (fp + tn + 1e-9)
+    return tpr, fpr
+
+  ts = np.linspace(-1.0, 1.0, 201)
+  roc = []
+  best_t, best_tpr = ts[0], -1.0
+  for t in ts:
+    tpr, fpr = event_vs_none_metrics(t)
+    roc.append((t, tpr, fpr))
+    if fpr <= target_fpr and tpr > best_tpr:
+      best_tpr = tpr
+      best_t = t
+
+  print(f"Selected None-bias threshold={best_t:.4f} with TPR={best_tpr:.4f} at FPR <= {target_fpr}")
+  return best_t, roc
+
+
+def predict_with_none_bias(model, x, none_idx: int, threshold: float):
+  """Apply biased decision rule at inference time.
+
+  - model: trained classifier (softmax output).
+  - x: input batch.
+  - none_idx: index of None/background class.
+  - threshold: chosen on (best_non_none_prob - none_prob).
+  """
+  probs = model(x, training=False).numpy()
+  num_classes = probs.shape[1]
+
+  non_none_mask = np.ones(num_classes, dtype=bool)
+  non_none_mask[none_idx] = False
+
+  best_non_none_idx = np.argmax(probs[:, non_none_mask], axis=1)
+  best_non_none_prob = probs[:, non_none_mask][np.arange(len(probs)), best_non_none_idx]
+  none_prob = probs[:, none_idx]
+  score = best_non_none_prob - none_prob
+
+  global_non_none_indices = np.arange(num_classes)[non_none_mask]
+  pred = np.full((len(probs),), fill_value=none_idx, dtype=int)
+  choose_event = (score >= threshold)
+  pred[choose_event] = global_non_none_indices[best_non_none_idx[choose_event]]
+  return pred
+
+# Compute ROC-style curve and suggested threshold for 'None' biasing
+if add_none_class:
+  none_idx = dataset.label_to_idx['None']
+  none_bias_threshold, none_bias_roc = compute_none_bias_threshold(classifier, test_ds, none_idx, target_fpr=0.10)
+  print(f"None-bias ROC points (sample): {none_bias_roc[:5]}")
+
+  # output plot of ROC curve
+  import matplotlib.pyplot as plt
+  fprs = [pt[2] for pt in none_bias_roc]
+  tprs = [pt[1] for pt in none_bias_roc]
+  plt.figure()
+  plt.plot(fprs, tprs, label='None-bias ROC')
+  plt.xlabel('False Positive Rate (None->Event)')
+  plt.ylabel('True Positive Rate (Event->Event)')
+  plt.title('ROC Curve for None-bias Thresholding')
+  plt.grid()
+  plt.savefig(f'yamnetmini_none_bias_roc_{seed}.png')
+
