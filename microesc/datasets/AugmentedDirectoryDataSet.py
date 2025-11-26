@@ -417,7 +417,8 @@ class AugmentedDirectoryDataSet:
         for clip in future.result():
           self._add_clip_internal(clip)
 
-    if self.max_samples_per_class:
+    # Allow override of max_samples_per_class for this addition
+    if self.max_samples_per_class and not max_samples:
       self._apply_max_samples_per_class()
 
     if self.uniform_classes_per_batch:

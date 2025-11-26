@@ -216,7 +216,7 @@ dataset = AugmentedDirectoryDataSet(
     ignore_directories=[d for d in os.listdir(dataset_path) if os.path.isdir(os.path.join(dataset_path, d)) and d not in selected_classes and d not in background_classes],
     background_classes=background_classes,
     background_to_event_ratio=[0.01, 0.3],
-    max_samples_per_class=500,  # Limit to 100 samples per class for few-shot, will be up to 20 per class in training set (20-80 split)
+    max_samples_per_class=100,  # Limit to 100 samples per class for few-shot, will be up to 20 per class in training set (20-80 split)
     use_metadata=True,
 )
 
@@ -224,10 +224,12 @@ if add_none_class:
   # Add background classes as "None" class
 
   # Compute max samples per background class to balance dataset
-  per_bg_class = max(dataset.label_counts.values()) // len(background_classes)
+  max_samples = max(dataset.label_counts.values())
+  #max_samples = 100
+  per_bg_class = max_samples // len(background_classes)
 
   print(dataset.label_counts.values())
-  print(f"Max samples per background class: {per_bg_class}")
+  #print(f"Max samples per background class: {per_bg_class}")
 
   for bg_class in background_classes:
     dataset.add_class_from_directory(
@@ -235,7 +237,7 @@ if add_none_class:
         path=os.path.join(dataset_path, bg_class),
         target_sample_rate_hz=params.sample_rate,
         target_clip_length=params.patch_window_seconds + params.stft_window_seconds - params.stft_hop_seconds,
-        max_samples=per_bg_class,
+        #max_samples=per_bg_class,
     )
 
 batch_size = 16
@@ -258,9 +260,9 @@ print(f"Extracted {X_train.shape[0]} training embeddings and {X_test.shape[0]} t
 # Create new classifier model for the extracted features
 classifier = keras.Sequential([
     keras.layers.Input(shape=model.output.shape[1:], dtype='float32'),
-    keras.layers.Dense(units=256 + 64, use_bias=True, activation='relu'),
+    keras.layers.Dense(units=256, use_bias=True, activation='gelu'),
     keras.layers.Dropout(0.25),
-    keras.layers.Dense(units=128 + 32, use_bias=True, activation='relu'),
+    keras.layers.Dense(units=128, use_bias=True, activation='gelu'),
     keras.layers.Dropout(0.25),
     keras.layers.Dense(units=(len(selected_classes) + 1) if add_none_class else len(selected_classes), use_bias=True, activation=params.classifier_activation)
 ])
@@ -278,7 +280,12 @@ classifier.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-4),
               metrics=[keras.metrics.SparseCategoricalAccuracy()])
 classifier.summary()
 
-history = classifier.fit(train_ds, epochs=10000, validation_data=test_ds, callbacks=[callback, lr_schedule], verbose=2)
+from sklearn.utils.class_weight import compute_class_weight
+classes = np.unique(y_train)
+cw = compute_class_weight('balanced', classes=classes, y=y_train)
+class_weight_dict = {int(c): float(w) for c, w in zip(classes, cw)}
+
+history = classifier.fit(train_ds, epochs=10000, validation_data=test_ds, callbacks=[callback, lr_schedule], verbose=2, class_weight=class_weight_dict)
 val_eval = classifier.evaluate(test_ds, return_dict=True)
 
 tools.plot_training_history(history, save_path=f'yamnetmini_training_history_fewshotclassifier_{seed}.png')
@@ -375,6 +382,21 @@ def predict_with_none_bias(model, x, none_idx: int, threshold: float):
   choose_event = (score >= threshold)
   pred[choose_event] = global_non_none_indices[best_non_none_idx[choose_event]]
   return pred
+
+
+from sklearn.metrics import classification_report, f1_score, roc_auc_score
+
+y_pred = np.argmax(classifier.predict(X_test), axis=1)
+print(classification_report(y_test, y_pred, target_names=[dataset.idx_to_label[i] for i in range(len(dataset.idx_to_label))]))
+print("Macro F1:", f1_score(y_test, y_pred, average='macro'))
+
+# per-class AUROC (one-vs-rest)
+probs = classifier.predict(X_test)
+for i in range(probs.shape[1]):
+    try:
+        print(dataset.idx_to_label[i], roc_auc_score((y_test == i).astype(int), probs[:, i]))
+    except Exception:
+        pass
 
 # Compute ROC-style curve and suggested threshold for 'None' biasing
 if add_none_class:
