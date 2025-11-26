@@ -8,6 +8,7 @@ from microesc.classification.yamnetmini import build_mini_yamnet_model
 from sklearn.utils.class_weight import compute_class_weight
 import shutil
 import uuid
+from collections import defaultdict
 
 from . import config
 from .state import global_state
@@ -26,7 +27,9 @@ def init_system():
             background_classes=[], # Will be updated dynamically via uploads
             use_metadata=True
         )
-        global_state.log("Dataset initialized.")
+        
+    # Don't automatically inject background classes here - the UI decides via 'none_cap'
+    global_state.log("Dataset initialized.")
 
     if global_state.base_model is None:
         params = config.params
@@ -75,6 +78,44 @@ def generate_embedding_dataset(seq, model):
     X = np.concatenate(embs, axis=0)
     y = np.concatenate(lbls, axis=0)
     return X, y
+
+def remove_label_from_dataset(dataset, label_to_remove: str):
+    """Remove all clips and references to a given label from a DirectoryDataSet/AugmentedDirectoryDataSet.
+    Rebuild label_to_idx, idx_to_label, and label_counts.
+    Returns True if the label was removed, False otherwise.
+    """
+    if label_to_remove not in dataset.label_to_idx:
+        return False
+
+    # Remove clips for the label
+    dataset.clips = [c for c in dataset.clips if c.label != label_to_remove]
+
+    # Remove label from set and counts
+    try:
+        dataset.labels.discard(label_to_remove)
+    except Exception:
+        pass
+    if label_to_remove in dataset.label_counts:
+        del dataset.label_counts[label_to_remove]
+
+    # Rebuild label_to_idx & idx_to_label from remaining labels
+    remaining_labels = sorted(list(set(c.label for c in dataset.clips)))
+    dataset.label_to_idx = {lbl: idx for idx, lbl in enumerate(remaining_labels)}
+    dataset.idx_to_label = {idx: lbl for lbl, idx in dataset.label_to_idx.items()}
+
+    # Update clip label idx values and recompute label_counts
+    dataset.label_counts = defaultdict(int)
+    for c in dataset.clips:
+        c.label_idx = dataset.label_to_idx[c.label]
+        dataset.label_counts[c.label] += 1
+
+    # Resplit train/test
+    try:
+        dataset._split_train_test()
+    except Exception:
+        pass
+
+    return True
 
 def add_file(file_obj, label, is_background, metadata_text):
     init_system()
@@ -131,6 +172,36 @@ def train_model(train_params):
         
         # Update dataset params
         dataset.training_split_percent = train_params.get('split', config.DEFAULT_TRAIN_SPLIT)
+
+        # Optionally add background (None) classes based on 'none_cap' training param.
+        none_cap = train_params.get('none_cap', None)
+        if none_cap is not None and none_cap > 0:
+            # Remove existing 'None' if present to allow re-adding with new cap
+            if 'None' in dataset.label_to_idx:
+                removed = remove_label_from_dataset(dataset, 'None')
+                global_state.log(f"Removed existing 'None' class: {removed}")
+
+            background_classes = ['Noise', 'VehicleExhaust', 'Wind']
+            dataset_path = '/isis/home/steing/AIDataSet'
+            per_bg_class = max(1, int(none_cap) // max(1, len(background_classes)))
+
+            for bg_class in background_classes:
+                bg_path = os.path.join(dataset_path, bg_class)
+                if os.path.exists(bg_path):
+                    global_state.dataset.add_class_from_directory(
+                        label='None',
+                        path=bg_path,
+                        target_sample_rate_hz=config.TARGET_SAMPLE_RATE,
+                        target_clip_length=config.TARGET_CLIP_LENGTH,
+                        use_metadata=True,
+                        max_samples=per_bg_class,
+                        resplit=False
+                    )
+                    global_state.log(f"Added background class {bg_class} as 'None' (max_samples={per_bg_class})")
+                else:
+                    global_state.log(f"Warning: Background class {bg_class} missing at {bg_path}")
+
+        # Perform the train/test split after any background additions
         dataset._split_train_test()
         
         batch_size = train_params.get('batch_size', config.DEFAULT_BATCH_SIZE)
@@ -146,6 +217,52 @@ def train_model(train_params):
         
         if len(X_train) == 0:
              raise ValueError("No training data extracted.")
+
+        # Debug logging: show label mapping and counts
+        try:
+            global_state.log(f"Dataset label_to_idx: {dataset.label_to_idx}")
+            for idx, label in dataset.idx_to_label.items():
+                count = dataset.label_counts.get(label, 0)
+                global_state.log(f"  idx {idx} => '{label}' : {count} samples")
+        except Exception:
+            global_state.log("Error while logging dataset label info")
+
+        # Show distribution of y_train mapped to label names
+        try:
+            u, c = np.unique(y_train, return_counts=True)
+            dist = {dataset.idx_to_label[int(ui)]: int(ci) for ui, ci in zip(u, c)}
+            global_state.log(f"y_train distribution: {dist}")
+        except Exception:
+            global_state.log(f"y_train values: {set(y_train.tolist()) if hasattr(y_train, 'tolist') else 'unknown'}")
+
+        # Basic checks: need at least two classes
+        if len(np.unique(y_train)) < 2:
+            global_state.log("Insufficient class diversity for training (only one class present). Aborting training.")
+            global_state.set_status("Error: insufficient class diversity")
+            return
+
+        # If 'None' class present, log details
+        if 'None' in dataset.label_to_idx:
+            none_idx_check = dataset.label_to_idx['None']
+            none_train = int(np.sum(y_train == none_idx_check))
+            none_val = int(np.sum(y_test == none_idx_check)) if len(y_test) > 0 else 0
+            global_state.log(f"'None' class idx={none_idx_check} train_samples={none_train}, val_samples={none_val}")
+            if none_train >= len(y_train):
+                global_state.log("All training samples belong to 'None' class. Aborting training.")
+                global_state.set_status("Error: only None class in training")
+                return
+            # Optional downsample of 'None' class to limit its dominance
+            none_cap = train_params.get('none_cap', None)
+            if none_cap is not None and none_train > none_cap:
+                global_state.log(f"Downsampling 'None' class from {none_train} to {none_cap} samples for training.")
+                none_indices = np.where(y_train == none_idx_check)[0]
+                keep_none = np.random.choice(none_indices, size=none_cap, replace=False)
+                non_none_indices = np.where(y_train != none_idx_check)[0]
+                keep_indices = np.concatenate([non_none_indices, keep_none])
+                # Sort indices to keep order (optional)
+                keep_indices.sort()
+                X_train = X_train[keep_indices]
+                y_train = y_train[keep_indices]
 
         global_state.log(f"Training on {len(X_train)} samples, validating on {len(X_test)} samples.")
 

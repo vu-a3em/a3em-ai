@@ -186,3 +186,4 @@ yamnet_adapter*.keras
 *confusion_matrix*.png
 *training_history*.png
 yamnetmini_none_bias_roc_*.png
+user_uploads/*

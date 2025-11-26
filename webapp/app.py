@@ -20,7 +20,7 @@ def upload_file_handler(file_obj, label, is_background, metadata):
     msg = worker.add_file(file_obj, label, is_background, metadata)
     return msg, get_dataset_summary()
 
-def start_training_handler(split, batch_size, epochs, lr, hidden_units_str, activation, dropout, target_fpr):
+def start_training_handler(split, batch_size, epochs, lr, hidden_units_str, activation, dropout, target_fpr, none_cap):
     if global_state.training_status == "Training":
         return "Training already in progress."
     
@@ -38,6 +38,7 @@ def start_training_handler(split, batch_size, epochs, lr, hidden_units_str, acti
         'activation': activation,
         'dropout': dropout,
         'target_fpr': target_fpr
+        , 'none_cap': int(none_cap) if none_cap and int(none_cap) > 0 else None
     }
     
     t = threading.Thread(target=worker.train_model, args=(params,))
@@ -104,15 +105,16 @@ with gr.Blocks(title="A3EM AI Trainer") as demo:
                 act_drop = gr.Dropdown(["relu", "gelu", "swish"], value="gelu", label="Activation")
                 drop_slider = gr.Slider(0.0, 0.5, value=0.25, label="Dropout")
                 fpr_slider = gr.Slider(0.01, 0.5, value=0.10, label="Target FPR (for None threshold)")
+                none_cap = gr.Number(value=0, label="Max 'None' samples to use (0=disabled)")
         
         train_btn = gr.Button("Start Training", variant="primary")
         status_txt = gr.Textbox(label="Training Status")
         log_txt = gr.TextArea(label="Training Log", lines=10, max_lines=20)
-        
+            
         train_btn.click(start_training_handler, 
-                        inputs=[split_slider, batch_slider, epochs_slider, lr_slider, hidden_in, act_drop, drop_slider, fpr_slider],
+                        inputs=[split_slider, batch_slider, epochs_slider, lr_slider, hidden_in, act_drop, drop_slider, fpr_slider, none_cap],
                         outputs=status_txt)
-        
+            
         # Manual refresh for logs (auto-refresh 'every' kwarg not supported in this version)
         refresh_logs_btn = gr.Button("Refresh Logs & Status")
         refresh_logs_btn.click(get_log_handler, None, log_txt)
