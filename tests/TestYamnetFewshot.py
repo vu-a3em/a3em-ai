@@ -136,6 +136,7 @@ else:
       ignore_directories=ignore_dirs,
       background_classes=background_classes,
       background_to_event_ratio=[0.01, 0.3],
+      use_metadata=True,
   )
 
   batch_size = 16
@@ -260,9 +261,7 @@ print(f"Extracted {X_train.shape[0]} training embeddings and {X_test.shape[0]} t
 # Create new classifier model for the extracted features
 classifier = keras.Sequential([
     keras.layers.Input(shape=model.output.shape[1:], dtype='float32'),
-    keras.layers.Dense(units=256, use_bias=True, activation='gelu'),
-    keras.layers.Dropout(0.25),
-    keras.layers.Dense(units=128, use_bias=True, activation='gelu'),
+    keras.layers.Dense(units=256, use_bias=True, activation='relu'),
     keras.layers.Dropout(0.25),
     keras.layers.Dense(units=(len(selected_classes) + 1) if add_none_class else len(selected_classes), use_bias=True, activation=params.classifier_activation)
 ])

@@ -100,30 +100,42 @@ def _process_audio_file(args):
       metadata_file = file[:-4] + '.meta'
       if os.path.exists(metadata_file):
         metadata = parse_metadata_func(metadata_file)
+        metadata_starts = np.array([start for start, _ in metadata])
 
     # Use the clipping from the metadata if requested
     if use_metadata and metadata:
-      for start_time in metadata:
+      for start_time, metadata_label in metadata:
         event_onset = start_time - event_start_offset
         event_end_time = event_onset + target_clip_length if target_clip_length else None
 
         if event_onset >= 0.0 and (not event_end_time or event_end_time <= audio_length_seconds):
-          clips.append(AudioClip(idx, label, file, event_onset, event_end_time, target_sample_rate_hz))
+          clips.append(AudioClip(idx, metadata_label, file, event_onset, event_end_time, target_sample_rate_hz))
     else:
       if event_detector:
         for event_onset in event_detector.detect_events(file):
-          if not metadata or np.isclose(metadata, event_onset, atol=event_detector_match_metadata_leeway_seconds).any():
+          if not metadata_starts or np.isclose(metadata_starts, event_onset, atol=event_detector_match_metadata_leeway_seconds).any():
             event_onset -= event_start_offset
             event_end_time = (event_onset + target_clip_length) if target_clip_length else None
             if event_onset >= 0.0 and (not event_end_time or event_end_time <= audio_length_seconds):
-              clips.append(AudioClip(idx, label, file, event_onset, event_end_time, target_sample_rate_hz))
+
+              metadata_label = None
+
+              if metadata and metadata_starts is not None:
+                # Check if the event onset matches any metadata start time
+                if np.isclose(metadata_starts, event_onset, atol=event_detector_match_metadata_leeway_seconds).any():
+                  metadata_label = next((label for start, label in metadata if np.isclose(start, event_onset, atol=event_detector_match_metadata_leeway_seconds)), None)
+
+              if metadata_label is None:
+                metadata_label = label  # Use the main label if no metadata match
+              
+              clips.append(AudioClip(idx, metadata_label, file, event_onset, event_end_time, target_sample_rate_hz))
       elif target_clip_length:
         if metadata:
-          for start_time in metadata:
+          for start_time, metadata_label in metadata:
             event_onset = start_time - event_start_offset
             event_end_time = event_onset + target_clip_length
             if event_onset >= 0.0 and event_end_time <= audio_length_seconds:
-              clips.append(AudioClip(idx, label, file, event_onset, event_end_time, target_sample_rate_hz))
+              clips.append(AudioClip(idx, metadata_label, file, event_onset, event_end_time, target_sample_rate_hz))
         else:
           for start_time in np.arange(0, audio_length_seconds, target_clip_length):
             event_end_time = start_time + target_clip_length
@@ -211,7 +223,8 @@ class AugmentedDirectoryDataSet:
                 for clip in future.result():
                     if clip.label in background_classes:
                         self.background_clips.append(clip)
-                    else:
+                    elif clip.label is not None and clip.label in self.labels:
+                        # Only add clips with valid labels
                         self._add_clip_internal(clip)
 
         # Limit number of samples per class if specified
@@ -237,7 +250,7 @@ class AugmentedDirectoryDataSet:
       for line in file:
         tokens = line.split(',')
         if len(tokens) >= 2 and tokens[-1].strip().lower() != 'ignore' and tokens[-1].strip().lower() != 'unknown':
-          metadata.append(float(tokens[-2].strip()))
+          metadata.append((float(tokens[-2].strip()), tokens[-1].strip()))
     return metadata
 
   def summary(self):
