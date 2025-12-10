@@ -52,6 +52,12 @@ def load_keras_model(model_path: str) -> keras.Model:
 def load_tflite_model(model_path: str) -> Interpreter:
   interpreter = Interpreter(model_path)
   interpreter.allocate_tensors()
+  in_details  = interpreter.get_input_details()[0]
+  out_details = interpreter.get_output_details()[0]
+
+  print("INPUT:", in_details["shape"], in_details["dtype"], "quant:", in_details["quantization"])
+  print("OUTPUT:", out_details["shape"], out_details["dtype"], "quant:", out_details["quantization"])
+
   return interpreter
 
 def test_tflite_model(model_path: str, test_dataset: PyDataset) -> float:

@@ -253,6 +253,7 @@ test_ds.summary()
 X_train, y_train = generate_embedding_dataset(train_ds)
 X_test, y_test = generate_embedding_dataset(test_ds)
 
+train_ds_orig, test_ds_orig = train_ds, test_ds
 train_ds = tf.data.Dataset.from_tensor_slices((X_train, y_train)).shuffle(len(y_train) if len(y_train) > 0 else 1).batch(batch_size).prefetch(tf.data.AUTOTUNE)
 test_ds = tf.data.Dataset.from_tensor_slices((X_test, y_test)).batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
@@ -415,3 +416,85 @@ if add_none_class:
   plt.grid()
   plt.savefig(f'yamnetmini_none_bias_roc_{seed}.png')
 
+# Recombine feature extractor and classifier, by layers
+for layer in classifier.layers:
+  model.add(layer)
+
+# Quick test of end-to-end model with original waveform inputs
+model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-4),  # type: ignore
+                    loss=keras.losses.SparseCategoricalCrossentropy(),
+                    metrics=[keras.metrics.SparseCategoricalAccuracy()])
+test_eval = model.evaluate(test_ds_orig, return_dict=True)
+print(f"End-to-end model test accuracy: {test_eval['sparse_categorical_accuracy']*100:.2f}%")
+
+# All layers trainable for quantization-aware training
+for layer in model.layers:
+  if not isinstance(layer, WaveformToLogMel) and not isinstance(layer, keras.layers.GroupNormalization):
+    layer.trainable = True
+
+# Create a quantization-aware version of the trained model
+from microesc.classification.Yamnet import WaveformToLogMel
+
+# First, replace GroupNormalization layers with Identity layers
+def replace_group_norm(layer: keras.layers.Layer):
+  if isinstance(layer, keras.layers.GroupNormalization):
+    return keras.layers.Identity(name=layer.name + "_identity")
+  return layer.__class__.from_config(layer.get_config())
+
+model_for_quant = keras.models.clone_model(model, clone_function=replace_group_norm)
+
+# Copy all weights to the model with Identity layers
+print("Preparing model for quantization...")
+for orig_layer, new_layer in zip(model.layers, model_for_quant.layers):
+  if isinstance(orig_layer, (keras.layers.GroupNormalization, WaveformToLogMel)):
+    continue
+  orig_weights = orig_layer.get_weights()
+  if orig_weights:
+    new_layer.set_weights(orig_weights)
+
+# Now use quantize_model which properly handles weight transfer
+def annotate_model_for_quantization(layer):
+  if isinstance(layer, (WaveformToLogMel, keras.layers.Identity)):
+    return layer
+  return tfmot.quantization.keras.quantize_annotate_layer(layer)
+
+# Annotate the model
+annotated_model = keras.models.clone_model(model_for_quant, clone_function=annotate_model_for_quantization)
+
+# Copy weights to annotated model
+for orig_layer, annot_layer in zip(model_for_quant.layers, annotated_model.layers):
+  orig_weights = orig_layer.get_weights()
+  if not orig_weights:
+    continue
+  # For annotated layers, set weights on the inner layer
+  if hasattr(annot_layer, 'layer'):
+    annot_layer.layer.set_weights(orig_weights)
+  else:
+    annot_layer.set_weights(orig_weights)
+
+# Apply quantization - this preserves the weights and adds quantization wrappers
+with tfmot.quantization.keras.quantize_scope({'WaveformToLogMel': WaveformToLogMel}):
+  quant_model: keras.Model = tfmot.quantization.keras.quantize_apply(annotated_model)
+
+print("Quantization applied successfully")
+quant_model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-4),  # type: ignore
+                    loss=keras.losses.SparseCategoricalCrossentropy(),
+                    metrics=[keras.metrics.SparseCategoricalAccuracy()])
+quant_model.summary()
+
+# Test initial quantized model accuracy
+test_eval = quant_model.evaluate(test_ds_orig, return_dict=True)
+print(f"Initial quantized model test accuracy: {test_eval['sparse_categorical_accuracy']*100:.2f}%")
+
+# Carry out quantization-aware training for better quantized model accuracy
+callback = keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+history = quant_model.fit(train_ds_orig, epochs=10000, validation_data=test_ds_orig, callbacks=[callback], verbose=2)  # type: ignore
+quant_model.evaluate(test_ds_orig, return_dict=True)
+tools.plot_training_history(history)
+tools.plot_confusion_matrix(quant_model, test_ds_orig, dataset.idx_to_label)
+quant_model.save(f'yamnetmini-quant-aware-{seed}.keras')
+
+# Convert the quantized model to quantized TFLite format
+tools.convert_keras_to_tflite(quant_model, f'yamnetmini-quantized-{seed}.tflite', True)
+
+print(f"Quantized TFLite model accuracy: {tools.test_tflite_model(f'yamnetmini-quantized-{seed}.tflite', test_ds_orig)}")

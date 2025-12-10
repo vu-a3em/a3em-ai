@@ -17,6 +17,9 @@ def get_dataset_summary():
     return df
 
 def upload_file_handler(file_obj, label, is_background, metadata):
+    if not file_obj:
+        return "No files selected.", get_dataset_summary()
+
     msg = worker.add_file(file_obj, label, is_background, metadata)
     return msg, get_dataset_summary()
 
@@ -78,7 +81,7 @@ with gr.Blocks(title="A3EM AI Trainer") as demo:
     with gr.Tab("Data Management"):
         with gr.Row():
             with gr.Column():
-                file_in = gr.File(label="Audio File")
+                file_in = gr.File(label="Audio File(s)", file_count="multiple")
                 label_in = gr.Textbox(label="Label")
                 is_bg_in = gr.Checkbox(label="Is Background/None")
                 meta_in = gr.TextArea(label="Metadata (CSV: timestamp,label)", placeholder="6.725604,Unknown\n6.803292,Fireworks")

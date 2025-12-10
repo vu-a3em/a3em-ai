@@ -428,7 +428,8 @@ class AugmentedDirectoryDataSet:
       futures = [executor.submit(_process_audio_file, args) for args in files_to_process]
       for future in as_completed(futures):
         for clip in future.result():
-          self._add_clip_internal(clip)
+          if clip.label is not None and clip.label in self.labels:
+            self._add_clip_internal(clip)
 
     # Allow override of max_samples_per_class for this addition
     if self.max_samples_per_class and not max_samples:

@@ -119,47 +119,54 @@ def remove_label_from_dataset(dataset, label_to_remove: str):
 
 def add_file(file_obj, label, is_background, metadata_text):
     init_system()
-    if file_obj is None:
-        return "No file provided."
-    
-    ext = os.path.splitext(file_obj.name)[1].lower()
-    if ext not in (".wav", ".flac", ".ogg", ".mp3", ".m4a"):
-        return "Unsupported file type."
 
-    label_dir = os.path.join(config.UPLOAD_ROOT, label if not is_background else "__background__")
-    os.makedirs(label_dir, exist_ok=True)
-    
-    filename = f"{uuid.uuid4().hex}{ext}"
-    dest = os.path.join(label_dir, filename)
-    shutil.copy(file_obj.name, dest)
+    def _add_single(target_file):
+        if target_file is None:
+            raise ValueError("No file provided.")
 
-    if metadata_text:
-        # Save as .meta file (CSV format)
-        meta_path = os.path.splitext(dest)[0] + ".meta"
-        with open(meta_path, "w") as f:
-            f.write(metadata_text)
-            
-    # Update dataset
-    # If is_background, we might want to add to background_clips
-    # But AugmentedDirectoryDataSet handles background_classes in init.
-    # We need to make sure the dataset knows about this new class or background.
-    
-    # If it's a new label, add_class_from_directory handles it.
-    # If it's background, we use add_background_from_directory or treat as class "None" if desired.
-    # The user prompt implies "None" class for background.
-    
-    target_label = label if not is_background else "None"
-    
-    global_state.dataset.add_class_from_directory(
-        label=target_label,
-        path=label_dir,
-        target_sample_rate_hz=config.TARGET_SAMPLE_RATE,
-        target_clip_length=config.TARGET_CLIP_LENGTH,
-        use_metadata=True,
-        resplit=True
-    )
-    
-    return f"Added file to label '{target_label}'"
+        ext = os.path.splitext(target_file.name)[1].lower()
+        if ext not in (".wav", ".flac", ".ogg", ".mp3", ".m4a"):
+            raise ValueError("Unsupported file type.")
+
+        label_dir = os.path.join(config.UPLOAD_ROOT, label if not is_background else "__background__")
+        os.makedirs(label_dir, exist_ok=True)
+        
+        filename = f"{uuid.uuid4().hex}{ext}"
+        dest = os.path.join(label_dir, filename)
+        shutil.copy(target_file.name, dest)
+
+        if metadata_text:
+            meta_path = os.path.splitext(dest)[0] + ".meta"
+            with open(meta_path, "w") as f:
+                f.write(metadata_text)
+                
+        target_label = label if not is_background else "None"
+        global_state.dataset.add_class_from_directory(
+            label=target_label,
+            path=label_dir,
+            target_sample_rate_hz=config.TARGET_SAMPLE_RATE,
+            target_clip_length=config.TARGET_CLIP_LENGTH,
+            use_metadata=True,
+            resplit=True
+        )
+
+        base_name = os.path.basename(target_file.name)
+        return f"{base_name}: Added file to label '{target_label}'"
+
+    if isinstance(file_obj, (list, tuple)):
+        messages = []
+        for item in file_obj:
+            try:
+                messages.append(_add_single(item))
+            except Exception as exc:
+                file_name = getattr(item, "name", "<unknown>")
+                messages.append(f"{file_name}: {str(exc)}")
+        return "\n".join(messages)
+
+    try:
+        return _add_single(file_obj)
+    except Exception as exc:
+        return str(exc)
 
 def train_model(train_params):
     init_system()

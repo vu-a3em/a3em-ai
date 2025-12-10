@@ -117,7 +117,7 @@ exit()
 # Create a quantization-aware version of the trained model
 from microesc.classification.Yamnet import WaveformToLogMel
 def apply_quantization(layer: keras.layers.Layer):
-  if not isinstance(layer, WaveformToLogMel):
+  if not isinstance(layer, WaveformToLogMel) and not isinstance(layer, keras.layers.GroupNormalization):
     return tfmot.quantization.keras.quantize_annotate_layer(layer)
   return layer
 quant_model = keras.models.clone_model(model, clone_function=apply_quantization)
