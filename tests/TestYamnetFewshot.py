@@ -443,26 +443,60 @@ model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-4),
 pre_quant_eval = model.evaluate(test_ds_orig, return_dict=True)
 print(f"Pre-quantization test accuracy: {pre_quant_eval['sparse_categorical_accuracy']*100:.2f}%")
 
-# KEEP GroupNormalization layers - they are essential!
-# Only quantize Dense, Conv2D, and DepthwiseConv2D layers
+# Replace GroupNormalization with LayerNormalization for TFLite compatibility
+# GroupNorm causes issues with TFLite's BROADCAST_TO operation
+def replace_groupnorm_with_layernorm(layer):
+  if isinstance(layer, keras.layers.GroupNormalization):
+    # LayerNormalization is similar to GroupNorm and well-supported in TFLite
+    # Get the axis from GroupNorm config
+    config = layer.get_config()
+    return keras.layers.LayerNormalization(
+        axis=-1,  # Normalize over the channel dimension
+        epsilon=config.get('epsilon', 1e-3),
+        name=layer.name + "_as_layernorm"
+    )
+  return layer.__class__.from_config(layer.get_config())
+
+print("\n=== REPLACING GROUPNORM WITH LAYERNORM ===")
+model_with_layernorm = keras.models.clone_model(model, clone_function=replace_groupnorm_with_layernorm)
+
+# Copy weights carefully - GroupNorm and LayerNorm have different weight structures
+print("Copying weights...")
+for orig_layer, new_layer in zip(model.layers, model_with_layernorm.layers):
+  if isinstance(orig_layer, (keras.layers.GroupNormalization, WaveformToLogMel)):
+    # For GroupNorm, we can't directly copy weights to LayerNorm, skip it
+    # The LayerNorm will be initialized randomly but will be fine-tuned during QAT
+    continue
+  orig_weights = orig_layer.get_weights()
+  if orig_weights:
+    new_layer.set_weights(orig_weights)
+
+# Test with LayerNorm replacement
+model_with_layernorm.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-4),
+                              loss=keras.losses.SparseCategoricalCrossentropy(),
+                              metrics=[keras.metrics.SparseCategoricalAccuracy()])
+ln_eval = model_with_layernorm.evaluate(test_ds_orig, return_dict=True)
+print(f"After GroupNorm->LayerNorm replacement test accuracy: {ln_eval['sparse_categorical_accuracy']*100:.2f}%")
+
+# Now apply quantization to everything except WaveformToLogMel and normalization layers
 def apply_selective_quantization(layer):
-  # Skip custom layers and GroupNormalization - keep them as-is
-  if isinstance(layer, (WaveformToLogMel, keras.layers.GroupNormalization)):
+  # Skip custom layers and normalization layers (not supported by tfmot)
+  if isinstance(layer, (WaveformToLogMel, keras.layers.LayerNormalization)):
     return layer
-  # Only quantize standard layers
+  # Quantize only these specific layer types
   quantize_types = (keras.layers.Dense, keras.layers.Conv2D, keras.layers.DepthwiseConv2D)
   if isinstance(layer, quantize_types):
     return tfmot.quantization.keras.quantize_annotate_layer(layer)
   # Return all other layers unchanged
   return layer
 
-print("\n=== APPLYING QUANTIZATION (keeping GroupNorm) ===")
+print("\n=== APPLYING QUANTIZATION ===")
 # Clone and annotate
-annotated_model = keras.models.clone_model(model, clone_function=apply_selective_quantization)
+annotated_model = keras.models.clone_model(model_with_layernorm, clone_function=apply_selective_quantization)
 
 # Copy weights to annotated model
 print("Copying weights to annotated model...")
-for orig_layer, annot_layer in zip(model.layers, annotated_model.layers):
+for orig_layer, annot_layer in zip(model_with_layernorm.layers, annotated_model.layers):
   orig_weights = orig_layer.get_weights()
   if not orig_weights:
     continue
