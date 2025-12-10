@@ -435,48 +435,58 @@ for layer in model.layers:
 # Create a quantization-aware version of the trained model
 from microesc.classification.Yamnet import WaveformToLogMel
 
-# First, replace GroupNormalization layers with Identity layers
-def replace_group_norm(layer: keras.layers.Layer):
-  if isinstance(layer, keras.layers.GroupNormalization):
-    return keras.layers.Identity(name=layer.name + "_identity")
-  return layer.__class__.from_config(layer.get_config())
+# Test the model BEFORE quantization to confirm accuracy
+print("\n=== PRE-QUANTIZATION TEST ===")
+model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-4),
+              loss=keras.losses.SparseCategoricalCrossentropy(),
+              metrics=[keras.metrics.SparseCategoricalAccuracy()])
+pre_quant_eval = model.evaluate(test_ds_orig, return_dict=True)
+print(f"Pre-quantization test accuracy: {pre_quant_eval['sparse_categorical_accuracy']*100:.2f}%")
 
-model_for_quant = keras.models.clone_model(model, clone_function=replace_group_norm)
-
-# Copy all weights to the model with Identity layers
-print("Preparing model for quantization...")
-for orig_layer, new_layer in zip(model.layers, model_for_quant.layers):
-  if isinstance(orig_layer, (keras.layers.GroupNormalization, WaveformToLogMel)):
-    continue
-  orig_weights = orig_layer.get_weights()
-  if orig_weights:
-    new_layer.set_weights(orig_weights)
-
-# Now use quantize_model which properly handles weight transfer
-def annotate_model_for_quantization(layer):
-  if isinstance(layer, (WaveformToLogMel, keras.layers.Identity)):
+# KEEP GroupNormalization layers - they are essential!
+# Only quantize Dense, Conv2D, and DepthwiseConv2D layers
+def apply_selective_quantization(layer):
+  # Skip custom layers and GroupNormalization - keep them as-is
+  if isinstance(layer, (WaveformToLogMel, keras.layers.GroupNormalization)):
     return layer
-  return tfmot.quantization.keras.quantize_annotate_layer(layer)
+  # Only quantize standard layers
+  quantize_types = (keras.layers.Dense, keras.layers.Conv2D, keras.layers.DepthwiseConv2D)
+  if isinstance(layer, quantize_types):
+    return tfmot.quantization.keras.quantize_annotate_layer(layer)
+  # Return all other layers unchanged
+  return layer
 
-# Annotate the model
-annotated_model = keras.models.clone_model(model_for_quant, clone_function=annotate_model_for_quantization)
+print("\n=== APPLYING QUANTIZATION (keeping GroupNorm) ===")
+# Clone and annotate
+annotated_model = keras.models.clone_model(model, clone_function=apply_selective_quantization)
 
 # Copy weights to annotated model
-for orig_layer, annot_layer in zip(model_for_quant.layers, annotated_model.layers):
+print("Copying weights to annotated model...")
+for orig_layer, annot_layer in zip(model.layers, annotated_model.layers):
   orig_weights = orig_layer.get_weights()
   if not orig_weights:
     continue
-  # For annotated layers, set weights on the inner layer
-  if hasattr(annot_layer, 'layer'):
-    annot_layer.layer.set_weights(orig_weights)
-  else:
-    annot_layer.set_weights(orig_weights)
+  try:
+    # For annotated layers, set weights on the inner layer
+    if hasattr(annot_layer, 'layer'):
+      annot_layer.layer.set_weights(orig_weights)
+    else:
+      annot_layer.set_weights(orig_weights)
+  except Exception as e:
+    print(f"Warning: Could not copy weights for {orig_layer.name}: {e}")
 
-# Apply quantization - this preserves the weights and adds quantization wrappers
+# Test annotated model before applying full quantization
+annotated_model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-4),
+                        loss=keras.losses.SparseCategoricalCrossentropy(),
+                        metrics=[keras.metrics.SparseCategoricalAccuracy()])
+annot_eval = annotated_model.evaluate(test_ds_orig, return_dict=True)
+print(f"After annotation (before quantize_apply) test accuracy: {annot_eval['sparse_categorical_accuracy']*100:.2f}%")
+
+# Apply full quantization
 with tfmot.quantization.keras.quantize_scope({'WaveformToLogMel': WaveformToLogMel}):
-  quant_model: keras.Model = tfmot.quantization.keras.quantize_apply(annotated_model)
+  quant_model = tfmot.quantization.keras.quantize_apply(annotated_model)
 
-print("Quantization applied successfully")
+print("✓ Quantization applied successfully")
 quant_model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-4),  # type: ignore
                     loss=keras.losses.SparseCategoricalCrossentropy(),
                     metrics=[keras.metrics.SparseCategoricalAccuracy()])
