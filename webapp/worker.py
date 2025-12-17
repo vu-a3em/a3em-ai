@@ -1,6 +1,7 @@
 import os
 import numpy as np
 import tensorflow as tf
+import subprocess
 from microesc import keras
 from microesc.datasets.AugmentedDirectoryDataSet import AugmentedDirectoryDataSet
 from microesc.classification.Yamnet import YamnetParams
@@ -46,7 +47,7 @@ def init_system():
         full_model = build_mini_yamnet_model(params, blocks=blocks, dense_units=[])
         
         # Load weights if available
-        model_path = os.path.join(config.BASE_DIR, "yamnetmini.keras")
+        model_path = os.path.join(config.BASE_DIR, "yamnetmini--1.keras")
         if os.path.exists(model_path):
              try:
                 full_model.load_weights(model_path)
@@ -61,6 +62,38 @@ def init_system():
         full_model.pop() 
         global_state.base_model = full_model
         global_state.log("Base model (feature extractor) ready.")
+
+def _convert_to_wav(src_path, target_sr):
+    """Convert an audio file to WAV at the requested sample rate using ffmpeg.
+    Returns the path to the created WAV file.
+    Raises RuntimeError on failure.
+    """
+    dest = os.path.splitext(src_path)[0] + ".wav"
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        src_path,
+        "-ar",
+        str(int(target_sr)),
+        dest,
+    ]
+    try:
+        completed = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+
+        # Check if the output file was created
+        if not os.path.exists(dest):
+            raise RuntimeError(f"ffmpeg conversion failed: output file {dest} not created")
+        
+        # Remove the original file if it was not a WAV
+        if os.path.splitext(src_path)[1].lower() != ".wav":
+            os.remove(src_path)
+    except FileNotFoundError:
+        raise RuntimeError("ffmpeg not found on system; required for audio conversion")
+    except subprocess.CalledProcessError as e:
+        stderr = e.stderr.decode(errors='ignore') if e.stderr is not None else str(e)
+        raise RuntimeError(f"ffmpeg conversion failed: {stderr}")
+    return dest
 
 def generate_embedding_dataset(seq, model):
     """Takes a KerasDataSet and returns (X, y) numpy arrays of embeddings."""
@@ -135,6 +168,18 @@ def add_file(file_obj, label, is_background, metadata_text):
         dest = os.path.join(label_dir, filename)
         shutil.copy(target_file.name, dest)
 
+        # Convert to WAV if necessary (use ffmpeg for broad container/codec support)
+        if ext != ".wav":
+            global_state.log(f"Converting {dest} to WAV format using ffmpeg.")
+            try:
+                dest_wav = _convert_to_wav(dest, config.TARGET_SAMPLE_RATE)
+            except Exception as e:
+                raise ValueError(f"Audio conversion failed: {e}")
+            if not os.path.exists(dest_wav):
+                raise ValueError(f"Conversion claimed success but {dest_wav} not found")
+            dest = dest_wav
+            global_state.log(f"Converted to WAV: {dest}")
+
         if metadata_text:
             meta_path = os.path.splitext(dest)[0] + ".meta"
             with open(meta_path, "w") as f:
@@ -159,6 +204,7 @@ def add_file(file_obj, label, is_background, metadata_text):
             try:
                 messages.append(_add_single(item))
             except Exception as exc:
+                print(f"Error adding file: {exc}")
                 file_name = getattr(item, "name", "<unknown>")
                 messages.append(f"{file_name}: {str(exc)}")
         return "\n".join(messages)
@@ -166,6 +212,7 @@ def add_file(file_obj, label, is_background, metadata_text):
     try:
         return _add_single(file_obj)
     except Exception as exc:
+        print(f"Error adding file: {exc}")
         return str(exc)
 
 def train_model(train_params):
@@ -403,8 +450,7 @@ def predict(audio_file, threshold_override=None):
     
     try:
         # Use base model to get embeddings
-        # We need to convert audio to log mel.
-        # Yamnet expects waveform.
+        # Yamnet expects waveform
         import librosa
         wav, sr = librosa.load(tmp_path, sr=config.TARGET_SAMPLE_RATE)
         
