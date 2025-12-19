@@ -6,11 +6,17 @@ from microesc.detection.SpectralFluxDetector import SpectralFluxDetector
 from microesc import keras
 import tensorflow_model_optimization as tfmot
 import microesc.tools as tools
+from microesc.tools.quantization import prepare_model_for_quantization
+from microesc.classification.training import (
+    TrainingConfig, generate_embedding_dataset, build_classifier_head,
+    compute_none_bias_threshold, predict_with_none_bias
+)
+from microesc.datasets.utils import add_background_as_none
 import itertools
 import tensorflow as tf
 import numpy as np
 
-from microesc.classification.yamnetmini import build_mini_yamnet_model
+from microesc.classification.yamnetmini import build_mini_yamnet_model, DEFAULT_BLOCKS
 
 #set seed for reproducibility
 if 'SEED' in os.environ:
@@ -21,7 +27,7 @@ else:
 tf.random.set_seed(seed)
 np.random.seed(seed)
 
-seed = -1
+#seed = -1
 
 # ignore_dirs = ['Gunshot',  'Fireworks', 'Drums', 'Engine', 'Noise']
 # For now, ignoring classes with way too many or too few samples
@@ -35,64 +41,8 @@ add_none_class = True
 params = YamnetParams()
 params.num_classes = 38 - len(ignore_dirs) 
 
-blocks = [
-  # Full
-  # [
-  #   (64, [3, 3], 1),
-  #   (128, [3, 3], 2),
-  #   (128, [3, 3], 1),
-  #   (256, [3, 3], 2),
-  #   (256, [3, 3], 1),
-  #   (512, [3, 3], 2),
-  #   (512, [3, 3], 1),
-  #   (512, [3, 3], 1),
-  #   (512, [3, 3], 1),
-  #   (512, [3, 3], 1),
-  #   (512, [3, 3], 1),
-  #   (1024, [3, 3], 2),
-  #   (1024, [3, 3], 1),
-  # ],
-  # # Larger
-  # [
-  #   (64, [3, 3], 1),
-  #   (128, [3, 3], 2),
-  #   (128, [3, 3], 1),
-  #   (256, [3, 3], 2),
-  #   (256, [3, 3], 1),
-  #   (512, [3, 3], 2),
-  #   (512, [3, 3], 1),
-  #   (1024, [3, 3], 2),
-  # ],
-  # # Original
-  # [
-  #   (64, [3, 3], 1),
-  #   (128, [3, 3], 2),
-  #   (128, [3, 3], 1),
-  #   (256, [3, 3], 2),
-  #   (256, [3, 3], 1),
-  #   (512, [3, 3], 2),
-  # ],
-  # # Smaller
-    (64, [3, 3], 1),
-    (128, [3, 3], 2),
-    (128, [3, 3], 1),
-    (256, [3, 3], 2),
-    (256, [3, 3], 1),
-  # Even smaller
-  # [
-  #   (64, [3, 3], 1),
-  #   (128, [3, 3], 2),
-  #   (128, [3, 3], 1),
-  #   (256, [3, 3], 2),
-  # ]
-  # Tiny
-  # [
-  #   (64, [3, 3], 1),
-  #   (128, [3, 3], 2),
-  #   (128, [3, 3], 1),
-  # ]
-]
-
+# Use default blocks from shared module
+blocks = DEFAULT_BLOCKS
 dense_units = []
 
 evals = []
@@ -179,29 +129,6 @@ else:
 # Pop off dense layer
 model.pop()
 
-# Use model for feature extraction on entire dataset
-# Preprocess the datasets to extract embeddings using the frozen Yamnet model
-def extract_yamnet_embeddings(waveforms, labels):
-  embeddings = model(waveforms, training=False)
-  return embeddings, labels
-
-# Generate embeddings to numpy arrays once, then create new tf.data.Dataset objects
-def generate_embedding_dataset(seq):
-  """Takes a KerasDataSet (keras.utils.Sequence) and returns (X, y) numpy arrays of embeddings and labels."""
-  embs = []
-  lbls = []
-  for i in range(len(seq)):
-    batch_waveforms, batch_labels = seq[i]
-    batch_embs = model(batch_waveforms, training=False)
-    # Convert to numpy if it's a Tensor
-    if hasattr(batch_embs, 'numpy'):
-      batch_embs = batch_embs.numpy()
-    embs.append(batch_embs)
-    lbls.append(batch_labels)
-  X = np.concatenate(embs, axis=0) if len(embs) > 0 else np.empty((0,) + model.output.shape[1:], dtype=np.float32)
-  y = np.concatenate(lbls, axis=0) if len(lbls) > 0 else np.empty((0,), dtype=np.int64)
-  return X, y
-
 print("Extracting embeddings for few-shot classes...")
 
 # Make new datasets with only the selected few-shot classes
@@ -249,9 +176,9 @@ dataset.summary()
 train_ds.summary()
 test_ds.summary()
 
-# Precompute and rebuild datasets
-X_train, y_train = generate_embedding_dataset(train_ds)
-X_test, y_test = generate_embedding_dataset(test_ds)
+# Precompute and rebuild datasets using shared utility
+X_train, y_train = generate_embedding_dataset(train_ds, model)
+X_test, y_test = generate_embedding_dataset(test_ds, model)
 
 train_ds_orig, test_ds_orig = train_ds, test_ds
 train_ds = tf.data.Dataset.from_tensor_slices((X_train, y_train)).shuffle(len(y_train) if len(y_train) > 0 else 1).batch(batch_size).prefetch(tf.data.AUTOTUNE)
@@ -259,23 +186,24 @@ test_ds = tf.data.Dataset.from_tensor_slices((X_test, y_test)).batch(batch_size)
 
 print(f"Extracted {X_train.shape[0]} training embeddings and {X_test.shape[0]} testing embeddings for few-shot classes.")
 
-# Create new classifier model for the extracted features
-classifier = keras.Sequential([
-    keras.layers.Input(shape=model.output.shape[1:], dtype='float32'),
-    keras.layers.Dense(units=256, use_bias=True, activation='relu'),
-    keras.layers.Dropout(0.25),
-    keras.layers.Dense(units=(len(selected_classes) + 1) if add_none_class else len(selected_classes), use_bias=True, activation=params.classifier_activation)
-])
-lr_schedule = keras.callbacks.ReduceLROnPlateau(
-    monitor='val_loss',
-    factor=0.5,
-    patience=5,
-    min_lr=1e-7,
-    verbose=1
+# Create new classifier model using shared utility
+training_config = TrainingConfig(
+    batch_size=batch_size,
+    learning_rate=1e-4,
+    epochs=10000,
+    patience=10,
+    dropout=0.25,
+    hidden_units=[256],
+    activation='relu'
 )
-callback = keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
 
-classifier.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-4),
+num_classes = (len(selected_classes) + 1) if add_none_class else len(selected_classes)
+classifier = build_classifier_head(model.output.shape[1:], num_classes, training_config)
+
+lr_schedule = training_config.create_lr_schedule('plateau', factor=0.5, schedule_patience=5, min_lr=1e-7)
+callback = keras.callbacks.EarlyStopping(monitor='val_loss', patience=training_config.patience, restore_best_weights=True)
+
+classifier.compile(optimizer=keras.optimizers.Adam(learning_rate=training_config.learning_rate),
               loss=keras.losses.SparseCategoricalCrossentropy(),
               metrics=[keras.metrics.SparseCategoricalAccuracy()])
 classifier.summary()
@@ -285,104 +213,12 @@ classes = np.unique(y_train)
 cw = compute_class_weight('balanced', classes=classes, y=y_train)
 class_weight_dict = {int(c): float(w) for c, w in zip(classes, cw)}
 
-history = classifier.fit(train_ds, epochs=10000, validation_data=test_ds, callbacks=[callback, lr_schedule], verbose=2, class_weight=class_weight_dict)
+history = classifier.fit(train_ds, epochs=training_config.epochs, validation_data=test_ds, callbacks=[callback, lr_schedule], verbose=2, class_weight=class_weight_dict)
 val_eval = classifier.evaluate(test_ds, return_dict=True)
 
 tools.plot_training_history(history, save_path=f'yamnetmini_training_history_fewshotclassifier_{seed}.png')
 tools.plot_confusion_matrix(classifier, test_ds, dataset.idx_to_label, save_path=f'yamnetmini_confusion_matrix_fewshotclassifier_{seed}.png')
 print(f"Yamnet-Mini + classifier achieved test accuracy {val_eval['sparse_categorical_accuracy']*100:.2f}%")
-
-# Helper: tune decision threshold to bias away from 'None' class
-
-def compute_none_bias_threshold(model, val_ds, none_idx: int, target_fpr: float = 0.10):
-  """Compute a decision threshold on (best_non_none_prob - none_prob).
-
-  - model: trained classifier (softmax probs output).
-  - val_ds: tf.data.Dataset of (X, y) for validation.
-  - none_idx: integer index of the None/background class.
-  - target_fpr: max allowed None->event false positive rate.
-
-  Returns: (best_threshold, roc_points) where roc_points is a list of (t, tpr, fpr).
-  """
-  y_true_list, y_prob_list = [], []
-  for xb, yb in val_ds:
-    probs = model(xb, training=False).numpy()
-    y_prob_list.append(probs)
-    y_true_list.append(yb.numpy())
-
-  if not y_true_list:
-    raise ValueError("Empty validation dataset passed to compute_none_bias_threshold")
-
-  y_true = np.concatenate(y_true_list)
-  y_prob = np.concatenate(y_prob_list)
-
-  num_classes = y_prob.shape[1]
-  non_none_mask = np.ones(num_classes, dtype=bool)
-  non_none_mask[none_idx] = False
-
-  best_non_none_idx = np.argmax(y_prob[:, non_none_mask], axis=1)
-  best_non_none_prob = y_prob[:, non_none_mask][np.arange(len(y_prob)), best_non_none_idx]
-  none_prob = y_prob[:, none_idx]
-  score = best_non_none_prob - none_prob
-
-  is_event_true = (y_true != none_idx)
-
-  def event_vs_none_metrics(t: float):
-    choose_event = (score >= t)
-    global_non_none_indices = np.arange(num_classes)[non_none_mask]
-    pred = np.full_like(y_true, fill_value=none_idx)
-    pred[choose_event] = global_non_none_indices[best_non_none_idx[choose_event]]
-
-    is_event_pred = (pred != none_idx)
-
-    tp = np.sum(is_event_pred & is_event_true)
-    fp = np.sum(is_event_pred & ~is_event_true)
-    fn = np.sum(~is_event_pred & is_event_true)
-    tn = np.sum(~is_event_pred & ~is_event_true)
-
-    tpr = tp / (tp + fn + 1e-9)
-    fpr = fp / (fp + tn + 1e-9)
-    return tpr, fpr
-
-  ts = np.linspace(-1.0, 1.0, 201)
-  roc = []
-  best_t, best_tpr = ts[0], -1.0
-  for t in ts:
-    tpr, fpr = event_vs_none_metrics(t)
-    roc.append((t, tpr, fpr))
-    if fpr <= target_fpr and tpr > best_tpr:
-      best_tpr = tpr
-      best_t = t
-
-  print(f"Selected None-bias threshold={best_t:.4f} with TPR={best_tpr:.4f} at FPR <= {target_fpr}")
-  return best_t, roc
-
-
-def predict_with_none_bias(model, x, none_idx: int, threshold: float):
-  """Apply biased decision rule at inference time.
-
-  - model: trained classifier (softmax output).
-  - x: input batch.
-  - none_idx: index of None/background class.
-  - threshold: chosen on (best_non_none_prob - none_prob).
-  """
-  probs = model(x, training=False).numpy()
-  num_classes = probs.shape[1]
-
-  non_none_mask = np.ones(num_classes, dtype=bool)
-  non_none_mask[none_idx] = False
-
-  best_non_none_idx = np.argmax(probs[:, non_none_mask], axis=1)
-  best_non_none_prob = probs[:, non_none_mask][np.arange(len(probs)), best_non_none_idx]
-  none_prob = probs[:, none_idx]
-  score = best_non_none_prob - none_prob
-
-  global_non_none_indices = np.arange(num_classes)[non_none_mask]
-  pred = np.full((len(probs),), fill_value=none_idx, dtype=int)
-  choose_event = (score >= threshold)
-  pred[choose_event] = global_non_none_indices[best_non_none_idx[choose_event]]
-  return pred
-
 
 from sklearn.metrics import classification_report, f1_score, roc_auc_score
 
@@ -432,10 +268,7 @@ for layer in model.layers:
   if not isinstance(layer, WaveformToLogMel) and not isinstance(layer, keras.layers.GroupNormalization):
     layer.trainable = True
 
-# Create a quantization-aware version of the trained model
-from microesc.classification.Yamnet import WaveformToLogMel
-
-# Test the model BEFORE quantization to confirm accuracy
+# Use shared quantization utilities
 print("\n=== PRE-QUANTIZATION TEST ===")
 model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-4),
               loss=keras.losses.SparseCategoricalCrossentropy(),
@@ -443,85 +276,9 @@ model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-4),
 pre_quant_eval = model.evaluate(test_ds_orig, return_dict=True)
 print(f"Pre-quantization test accuracy: {pre_quant_eval['sparse_categorical_accuracy']*100:.2f}%")
 
-# Replace GroupNormalization with LayerNormalization for TFLite compatibility
-# GroupNorm causes issues with TFLite's BROADCAST_TO operation
-def replace_groupnorm_with_layernorm(layer):
-  if isinstance(layer, keras.layers.GroupNormalization):
-    # LayerNormalization is similar to GroupNorm and well-supported in TFLite
-    # Get the axis from GroupNorm config
-    config = layer.get_config()
-    return keras.layers.LayerNormalization(
-        axis=-1,  # Normalize over the channel dimension
-        epsilon=config.get('epsilon', 1e-3),
-        name=layer.name + "_as_layernorm"
-    )
-  return layer.__class__.from_config(layer.get_config())
-
-print("\n=== REPLACING GROUPNORM WITH LAYERNORM ===")
-model_with_layernorm = keras.models.clone_model(model, clone_function=replace_groupnorm_with_layernorm)
-
-# Copy weights carefully - GroupNorm and LayerNorm have different weight structures
-print("Copying weights...")
-for orig_layer, new_layer in zip(model.layers, model_with_layernorm.layers):
-  if isinstance(orig_layer, (keras.layers.GroupNormalization, WaveformToLogMel)):
-    # For GroupNorm, we can't directly copy weights to LayerNorm, skip it
-    # The LayerNorm will be initialized randomly but will be fine-tuned during QAT
-    continue
-  orig_weights = orig_layer.get_weights()
-  if orig_weights:
-    new_layer.set_weights(orig_weights)
-
-# Test with LayerNorm replacement
-model_with_layernorm.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-4),
-                              loss=keras.losses.SparseCategoricalCrossentropy(),
-                              metrics=[keras.metrics.SparseCategoricalAccuracy()])
-ln_eval = model_with_layernorm.evaluate(test_ds_orig, return_dict=True)
-print(f"After GroupNorm->LayerNorm replacement test accuracy: {ln_eval['sparse_categorical_accuracy']*100:.2f}%")
-
-# Now apply quantization to everything except WaveformToLogMel and normalization layers
-def apply_selective_quantization(layer):
-  # Skip custom layers and normalization layers (not supported by tfmot)
-  if isinstance(layer, (WaveformToLogMel, keras.layers.LayerNormalization)):
-    return layer
-  # Quantize only these specific layer types
-  quantize_types = (keras.layers.Dense, keras.layers.Conv2D, keras.layers.DepthwiseConv2D)
-  if isinstance(layer, quantize_types):
-    return tfmot.quantization.keras.quantize_annotate_layer(layer)
-  # Return all other layers unchanged
-  return layer
-
-print("\n=== APPLYING QUANTIZATION ===")
-# Clone and annotate
-annotated_model = keras.models.clone_model(model_with_layernorm, clone_function=apply_selective_quantization)
-
-# Copy weights to annotated model
-print("Copying weights to annotated model...")
-for orig_layer, annot_layer in zip(model_with_layernorm.layers, annotated_model.layers):
-  orig_weights = orig_layer.get_weights()
-  if not orig_weights:
-    continue
-  try:
-    # For annotated layers, set weights on the inner layer
-    if hasattr(annot_layer, 'layer'):
-      annot_layer.layer.set_weights(orig_weights)
-    else:
-      annot_layer.set_weights(orig_weights)
-  except Exception as e:
-    print(f"Warning: Could not copy weights for {orig_layer.name}: {e}")
-
-# Test annotated model before applying full quantization
-annotated_model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-4),
-                        loss=keras.losses.SparseCategoricalCrossentropy(),
-                        metrics=[keras.metrics.SparseCategoricalAccuracy()])
-annot_eval = annotated_model.evaluate(test_ds_orig, return_dict=True)
-print(f"After annotation (before quantize_apply) test accuracy: {annot_eval['sparse_categorical_accuracy']*100:.2f}%")
-
-# Apply full quantization
-with tfmot.quantization.keras.quantize_scope({'WaveformToLogMel': WaveformToLogMel}):
-  quant_model = tfmot.quantization.keras.quantize_apply(annotated_model)
-
-print("✓ Quantization applied successfully")
-quant_model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-4),  # type: ignore
+# Prepare model for quantization using shared utility
+quant_model = prepare_model_for_quantization(model, verbose=True)
+quant_model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-4),
                     loss=keras.losses.SparseCategoricalCrossentropy(),
                     metrics=[keras.metrics.SparseCategoricalAccuracy()])
 quant_model.summary()
@@ -532,7 +289,7 @@ print(f"Initial quantized model test accuracy: {test_eval['sparse_categorical_ac
 
 # Carry out quantization-aware training for better quantized model accuracy
 callback = keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
-history = quant_model.fit(train_ds_orig, epochs=10000, validation_data=test_ds_orig, callbacks=[callback], verbose=2)  # type: ignore
+history = quant_model.fit(train_ds_orig, epochs=10000, validation_data=test_ds_orig, callbacks=[callback], verbose=2)
 quant_model.evaluate(test_ds_orig, return_dict=True)
 tools.plot_training_history(history)
 tools.plot_confusion_matrix(quant_model, test_ds_orig, dataset.idx_to_label)

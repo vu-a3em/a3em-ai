@@ -1,15 +1,20 @@
 import os
 import numpy as np
 import tensorflow as tf
-import subprocess
 from microesc import keras
 from microesc.datasets.AugmentedDirectoryDataSet import AugmentedDirectoryDataSet
 from microesc.classification.Yamnet import YamnetParams
-from microesc.classification.yamnetmini import build_mini_yamnet_model
+from microesc.classification.yamnetmini import build_mini_yamnet_model, DEFAULT_BLOCKS
+from microesc.classification.training import (
+    TrainingConfig, generate_embedding_dataset, build_classifier_head,
+    compute_none_bias_threshold, predict_with_none_bias
+)
+from microesc.datasets.utils import remove_label_from_dataset, add_background_as_none, downsample_none_class
+from microesc.tools.audio import convert_to_wav
 from sklearn.utils.class_weight import compute_class_weight
 import shutil
 import uuid
-from collections import defaultdict
+import librosa
 
 from . import config
 from .state import global_state
@@ -34,17 +39,9 @@ def init_system():
 
     if global_state.base_model is None:
         params = config.params
-        # Blocks definition matching the one used in tests
-        blocks = [
-            (64, [3, 3], 1),
-            (128, [3, 3], 2),
-            (128, [3, 3], 1),
-            (256, [3, 3], 2),
-            (256, [3, 3], 1),
-        ]
         
-        # Build full model
-        full_model = build_mini_yamnet_model(params, blocks=blocks, dense_units=[])
+        # Build full model using default architecture
+        full_model = build_mini_yamnet_model(params, blocks=DEFAULT_BLOCKS, dense_units=[])
         
         # Load weights if available
         model_path = os.path.join(config.BASE_DIR, "yamnetmini--1.keras")
@@ -63,92 +60,6 @@ def init_system():
         global_state.base_model = full_model
         global_state.log("Base model (feature extractor) ready.")
 
-def _convert_to_wav(src_path, target_sr):
-    """Convert an audio file to WAV at the requested sample rate using ffmpeg.
-    Returns the path to the created WAV file.
-    Raises RuntimeError on failure.
-    """
-    dest = os.path.splitext(src_path)[0] + ".wav"
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        src_path,
-        "-ar",
-        str(int(target_sr)),
-        dest,
-    ]
-    try:
-        completed = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-
-        # Check if the output file was created
-        if not os.path.exists(dest):
-            raise RuntimeError(f"ffmpeg conversion failed: output file {dest} not created")
-        
-        # Remove the original file if it was not a WAV
-        if os.path.splitext(src_path)[1].lower() != ".wav":
-            os.remove(src_path)
-    except FileNotFoundError:
-        raise RuntimeError("ffmpeg not found on system; required for audio conversion")
-    except subprocess.CalledProcessError as e:
-        stderr = e.stderr.decode(errors='ignore') if e.stderr is not None else str(e)
-        raise RuntimeError(f"ffmpeg conversion failed: {stderr}")
-    return dest
-
-def generate_embedding_dataset(seq, model):
-    """Takes a KerasDataSet and returns (X, y) numpy arrays of embeddings."""
-    embs = []
-    lbls = []
-    for i in range(len(seq)):
-        batch_waveforms, batch_labels = seq[i]
-        batch_embs = model(batch_waveforms, training=False)
-        if hasattr(batch_embs, 'numpy'):
-            batch_embs = batch_embs.numpy()
-        embs.append(batch_embs)
-        lbls.append(batch_labels)
-    if len(embs) == 0:
-        return np.array([]), np.array([])
-    X = np.concatenate(embs, axis=0)
-    y = np.concatenate(lbls, axis=0)
-    return X, y
-
-def remove_label_from_dataset(dataset, label_to_remove: str):
-    """Remove all clips and references to a given label from a DirectoryDataSet/AugmentedDirectoryDataSet.
-    Rebuild label_to_idx, idx_to_label, and label_counts.
-    Returns True if the label was removed, False otherwise.
-    """
-    if label_to_remove not in dataset.label_to_idx:
-        return False
-
-    # Remove clips for the label
-    dataset.clips = [c for c in dataset.clips if c.label != label_to_remove]
-
-    # Remove label from set and counts
-    try:
-        dataset.labels.discard(label_to_remove)
-    except Exception:
-        pass
-    if label_to_remove in dataset.label_counts:
-        del dataset.label_counts[label_to_remove]
-
-    # Rebuild label_to_idx & idx_to_label from remaining labels
-    remaining_labels = sorted(list(set(c.label for c in dataset.clips)))
-    dataset.label_to_idx = {lbl: idx for idx, lbl in enumerate(remaining_labels)}
-    dataset.idx_to_label = {idx: lbl for lbl, idx in dataset.label_to_idx.items()}
-
-    # Update clip label idx values and recompute label_counts
-    dataset.label_counts = defaultdict(int)
-    for c in dataset.clips:
-        c.label_idx = dataset.label_to_idx[c.label]
-        dataset.label_counts[c.label] += 1
-
-    # Resplit train/test
-    try:
-        dataset._split_train_test()
-    except Exception:
-        pass
-
-    return True
 
 def add_file(file_obj, label, is_background, metadata_text):
     init_system()
@@ -172,13 +83,10 @@ def add_file(file_obj, label, is_background, metadata_text):
         if ext != ".wav":
             global_state.log(f"Converting {dest} to WAV format using ffmpeg.")
             try:
-                dest_wav = _convert_to_wav(dest, config.TARGET_SAMPLE_RATE)
+                dest = convert_to_wav(dest, config.TARGET_SAMPLE_RATE, remove_original=True)
+                global_state.log(f"Converted to WAV: {dest}")
             except Exception as e:
                 raise ValueError(f"Audio conversion failed: {e}")
-            if not os.path.exists(dest_wav):
-                raise ValueError(f"Conversion claimed success but {dest_wav} not found")
-            dest = dest_wav
-            global_state.log(f"Converted to WAV: {dest}")
 
         if metadata_text:
             meta_path = os.path.splitext(dest)[0] + ".meta"
@@ -237,23 +145,17 @@ def train_model(train_params):
 
             background_classes = ['Noise', 'VehicleExhaust', 'Wind']
             dataset_path = '/isis/home/steing/AIDataSet'
-            per_bg_class = max(1, int(none_cap) // max(1, len(background_classes)))
-
-            for bg_class in background_classes:
-                bg_path = os.path.join(dataset_path, bg_class)
-                if os.path.exists(bg_path):
-                    global_state.dataset.add_class_from_directory(
-                        label='None',
-                        path=bg_path,
-                        target_sample_rate_hz=config.TARGET_SAMPLE_RATE,
-                        target_clip_length=config.TARGET_CLIP_LENGTH,
-                        use_metadata=True,
-                        max_samples=per_bg_class,
-                        resplit=False
-                    )
-                    global_state.log(f"Added background class {bg_class} as 'None' (max_samples={per_bg_class})")
-                else:
-                    global_state.log(f"Warning: Background class {bg_class} missing at {bg_path}")
+            
+            num_added = add_background_as_none(
+                dataset=dataset,
+                dataset_path=dataset_path,
+                background_classes=background_classes,
+                max_none_samples=int(none_cap),
+                target_sample_rate_hz=config.TARGET_SAMPLE_RATE,
+                target_clip_length=config.TARGET_CLIP_LENGTH,
+                use_metadata=True
+            )
+            global_state.log(f"Added {num_added} background samples as 'None' class")
 
         # Perform the train/test split after any background additions
         dataset._split_train_test()
@@ -309,41 +211,33 @@ def train_model(train_params):
             none_cap = train_params.get('none_cap', None)
             if none_cap is not None and none_train > none_cap:
                 global_state.log(f"Downsampling 'None' class from {none_train} to {none_cap} samples for training.")
-                none_indices = np.where(y_train == none_idx_check)[0]
-                keep_none = np.random.choice(none_indices, size=none_cap, replace=False)
-                non_none_indices = np.where(y_train != none_idx_check)[0]
-                keep_indices = np.concatenate([non_none_indices, keep_none])
-                # Sort indices to keep order (optional)
-                keep_indices.sort()
-                X_train = X_train[keep_indices]
-                y_train = y_train[keep_indices]
+                X_train, y_train = downsample_none_class(X_train, y_train, none_idx_check, none_cap)
 
         global_state.log(f"Training on {len(X_train)} samples, validating on {len(X_test)} samples.")
 
-        # Build classifier head
+        # Build classifier head using shared utility
         input_shape = base_model.output.shape[1:]
-        
-        hidden_units = train_params.get('hidden_units', [256, 128])
-        activation = train_params.get('activation', 'gelu')
-        dropout = train_params.get('dropout', 0.25)
-        
-        layers = [keras.layers.Input(shape=input_shape, dtype='float32')]
-        for units in hidden_units:
-            layers.append(keras.layers.Dense(units=units, activation=activation))
-            layers.append(keras.layers.Dropout(dropout))
-        
-        # Output layer
-        # dataset.label_to_idx contains all classes including "None" if added
         num_classes = len(dataset.label_to_idx)
-        layers.append(keras.layers.Dense(units=num_classes, activation='softmax'))
         
-        classifier = keras.Sequential(layers)
+        training_config = TrainingConfig(
+            batch_size=train_params.get('batch_size', config.DEFAULT_BATCH_SIZE),
+            learning_rate=train_params.get('lr', config.DEFAULT_LEARNING_RATE),
+            epochs=train_params.get('epochs', config.DEFAULT_EPOCHS),
+            patience=train_params.get('patience', config.DEFAULT_PATIENCE),
+            hidden_units=train_params.get('hidden_units', [256, 128]),
+            activation=train_params.get('activation', 'relu'),
+            dropout=train_params.get('dropout', 0.25),
+            target_fpr=train_params.get('target_fpr', 0.10)
+        )
+        
+        classifier = build_classifier_head(input_shape, num_classes, training_config)
         
         # Compile
-        lr = train_params.get('lr', config.DEFAULT_LEARNING_RATE)
-        classifier.compile(optimizer=keras.optimizers.Adam(learning_rate=lr),
-                           loss=keras.losses.SparseCategoricalCrossentropy(),
-                           metrics=[keras.metrics.SparseCategoricalAccuracy()])
+        classifier.compile(
+            optimizer=keras.optimizers.Adam(learning_rate=training_config.learning_rate),
+            loss=keras.losses.SparseCategoricalCrossentropy(),
+            metrics=[keras.metrics.SparseCategoricalAccuracy()]
+        )
         
         # Class weights
         classes = np.unique(y_train)
@@ -351,18 +245,20 @@ def train_model(train_params):
         class_weight_dict = {int(c): float(w) for c, w in zip(classes, cw)}
         
         # Callbacks
-        patience = train_params.get('patience', config.DEFAULT_PATIENCE)
-        callback = keras.callbacks.EarlyStopping(monitor='val_loss', patience=patience, restore_best_weights=True)
+        callback = keras.callbacks.EarlyStopping(
+            monitor='val_loss', 
+            patience=training_config.patience, 
+            restore_best_weights=True
+        )
         
         class LogCallback(keras.callbacks.Callback):
             def on_epoch_end(self, epoch, logs=None):
                 msg = f"Epoch {epoch+1}: loss={logs['loss']:.4f}, val_loss={logs['val_loss']:.4f}, acc={logs['sparse_categorical_accuracy']:.4f}"
                 global_state.log(msg)
         
-        epochs = train_params.get('epochs', config.DEFAULT_EPOCHS)
         classifier.fit(X_train, y_train, 
                        validation_data=(X_test, y_test) if len(X_test) > 0 else None,
-                       epochs=epochs,
+                       epochs=training_config.epochs,
                        callbacks=[callback, LogCallback()],
                        class_weight=class_weight_dict,
                        verbose=0)
@@ -370,54 +266,29 @@ def train_model(train_params):
         global_state.classifier = classifier
         global_state.log("Training complete.")
         
-        # Compute None bias threshold
+        # Compute None bias threshold using shared utility
         none_label = "None"
         if none_label in dataset.label_to_idx and len(X_test) > 0:
             global_state.log("Computing None-bias threshold...")
             none_idx = dataset.label_to_idx[none_label]
             global_state.none_idx = none_idx
             
-            probs = classifier.predict(X_test)
-            y_true = y_test
+            # Create a simple tf.data.Dataset for the shared function
+            test_ds_for_threshold = tf.data.Dataset.from_tensor_slices((X_test, y_test)).batch(batch_size)
             
-            num_classes = probs.shape[1]
-            non_none_mask = np.ones(num_classes, dtype=bool)
-            non_none_mask[none_idx] = False
-            
-            best_non_none_idx = np.argmax(probs[:, non_none_mask], axis=1)
-            best_non_none_prob = probs[:, non_none_mask][np.arange(len(probs)), best_non_none_idx]
-            none_prob = probs[:, none_idx]
-            score = best_non_none_prob - none_prob
-            
-            is_event_true = (y_true != none_idx)
-            
-            ts = np.linspace(-1.0, 1.0, 201)
-            roc = []
-            best_t, best_tpr = ts[0], -1.0
-            target_fpr = train_params.get('target_fpr', 0.10)
-            
-            for t in ts:
-                choose_event = (score >= t)
-                # pred logic
-                # We only care about TPR/FPR here
-                is_event_pred = choose_event
-                
-                tp = np.sum(is_event_pred & is_event_true)
-                fp = np.sum(is_event_pred & ~is_event_true)
-                fn = np.sum(~is_event_pred & is_event_true)
-                tn = np.sum(~is_event_pred & ~is_event_true)
-                
-                tpr = tp / (tp + fn + 1e-9)
-                fpr = fp / (fp + tn + 1e-9)
-                
-                roc.append((float(t), float(tpr), float(fpr)))
-                if fpr <= target_fpr and tpr > best_tpr:
-                    best_tpr = tpr
-                    best_t = t
+            best_t, roc = compute_none_bias_threshold(
+                classifier, 
+                test_ds_for_threshold, 
+                none_idx, 
+                training_config.target_fpr
+            )
             
             global_state.none_bias_threshold = float(best_t)
             global_state.roc_curve = roc
-            global_state.log(f"Selected None-bias threshold={best_t:.4f} (TPR={best_tpr:.4f}, FPR<={target_fpr})")
+            
+            # Find TPR for logging
+            best_tpr = next((tpr for t, tpr, fpr in roc if abs(t - best_t) < 0.001), 0.0)
+            global_state.log(f"Selected None-bias threshold={best_t:.4f} (TPR={best_tpr:.4f}, FPR<={training_config.target_fpr})")
             
         global_state.set_status("Done")
 
@@ -471,33 +342,22 @@ def predict(audio_file, threshold_override=None):
         
         embeddings = global_state.base_model(wav_batch, training=False).numpy()
         
-        probs = global_state.classifier.predict(embeddings)
-        
-        # Apply threshold
+        # Apply None-bias threshold if available
         threshold = threshold_override if threshold_override is not None else global_state.none_bias_threshold
         none_idx = global_state.none_idx
         
-        if none_idx is not None:
-            num_classes = probs.shape[1]
-            non_none_mask = np.ones(num_classes, dtype=bool)
-            non_none_mask[none_idx] = False
-            
-            best_non_none_idx = np.argmax(probs[:, non_none_mask], axis=1)[0]
-            best_non_none_prob = probs[:, non_none_mask][0, best_non_none_idx]
-            none_prob = probs[0, none_idx]
-            score = best_non_none_prob - none_prob
-            
-            if score >= threshold:
-                # Map back to global index
-                global_indices = np.arange(num_classes)[non_none_mask]
-                pred_idx = global_indices[best_non_none_idx]
-            else:
-                pred_idx = none_idx
+        if none_idx is not None and threshold is not None:
+            # Use shared prediction utility with bias correction
+            pred = predict_with_none_bias(global_state.classifier, embeddings, none_idx, threshold)
+            pred_idx = pred[0]
+            probs = global_state.classifier.predict(embeddings)
         else:
+            # Simple argmax prediction
+            probs = global_state.classifier.predict(embeddings)
             pred_idx = np.argmax(probs[0])
             
         label = global_state.dataset.idx_to_label[pred_idx]
-        confidence = float(np.max(probs[0]))
+        confidence = float(probs[0, pred_idx])
         
         return label, confidence, None # Plot?
 

@@ -1,8 +1,33 @@
 from microesc.classification.Yamnet import YamnetParams, WaveformToLogMel
 from microesc import keras
 
-def build_mini_yamnet_model(params: YamnetParams, blocks , dense_units) -> keras.Model:
-  # A smaller version of Yamnet for less capable hardware
+# Default architecture used in production (webapp and few-shot learning)
+DEFAULT_BLOCKS = [
+    (64, [3, 3], 1),
+    (128, [3, 3], 2),
+    (128, [3, 3], 1),
+    (256, [3, 3], 2),
+    (256, [3, 3], 1),
+]
+
+DEFAULT_DENSE_UNITS = []
+
+def build_mini_yamnet_model(params: YamnetParams, blocks=None, dense_units=None) -> keras.Model:
+  """Build a smaller version of Yamnet for less capable hardware.
+  
+  Args:
+      params: YamnetParams configuration
+      blocks: List of (filters, kernel_size, strides) tuples. Defaults to DEFAULT_BLOCKS.
+      dense_units: List of dense layer units. Defaults to DEFAULT_DENSE_UNITS (empty).
+  
+  Returns:
+      Compiled Keras model
+  """
+  if blocks is None:
+      blocks = DEFAULT_BLOCKS
+  if dense_units is None:
+      dense_units = DEFAULT_DENSE_UNITS
+  
   def _build_block(filters: int, kernel_size: list, strides: int) -> list[keras.layers.Layer]:
     return [
       keras.layers.DepthwiseConv2D(kernel_size=kernel_size, strides=strides, depth_multiplier=1, padding=params.conv_padding, use_bias=False),
