@@ -122,8 +122,7 @@ def add_file(file_obj, label, is_background, metadata_text):
                 )
 
                 try:
-                    wav, _ = librosa.load(dest, sr=config.TARGET_SAMPLE_RATE, mono=True)
-                    event_times = detector.find_events(wav)
+                    event_times = detector.detect_events(dest)
 
                     # Write metadata file
                     with open(meta_path, "w") as f:
@@ -133,8 +132,14 @@ def add_file(file_obj, label, is_background, metadata_text):
                     global_state.log(f"Detected {len(event_times)} events in {os.path.basename(dest)}")
                     use_metadata = True
                 except Exception as e:
-                    global_state.log(f"Event detection failed: {e}. Using full file.")
-                    use_metadata = False
+                    # Log and abort processing this file — do not continue with full-file fallback
+                    global_state.log(f"Event detection failed: {e}. Aborting file addition.")
+                    try:
+                        if dest and os.path.exists(dest):
+                            os.remove(dest)
+                    except Exception:
+                        pass
+                    raise RuntimeError(f"Event detection failed for {os.path.basename(dest)}: {e}")
             else:
                 # No metadata, no event detection - use full file
                 use_metadata = False
