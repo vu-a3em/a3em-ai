@@ -181,13 +181,19 @@ def add_file(file_obj, label, is_background, metadata_text):
                                     target_sample_rate_hz=config.TARGET_SAMPLE_RATE
                                 )
                                 clips_to_add.append(clip)
-                                global_state.dataset.label_counts[clip_label] += 1
                             except ValueError:
                                 continue
 
                 if clips_to_add:
-                    global_state.dataset.add_clips_for_label(target_label, clips_to_add, is_background=is_background, resplit=False)
-                    num_clips = len(clips_to_add)
+                    # Group clips by their metadata label so we add them under the correct label
+                    grouped = {}
+                    for c in clips_to_add:
+                        grouped.setdefault(c.label, []).append(c)
+                    num_clips = 0
+                    for lbl, group in grouped.items():
+                        # Ensure label exists in dataset mapping (add_clips_for_label will also ensure this)
+                        global_state.dataset.add_clips_for_label(lbl, group, is_background=is_background, resplit=False)
+                        num_clips += len(group)
             else:
                 # No metadata - add entire file as single clip
                 if target_label not in global_state.dataset.label_to_idx:
@@ -206,7 +212,6 @@ def add_file(file_obj, label, is_background, metadata_text):
                     target_sample_rate_hz=config.TARGET_SAMPLE_RATE
                 )
                 global_state.dataset.add_clips_for_label(target_label, [clip], is_background=is_background, resplit=False)
-                global_state.dataset.label_counts[target_label] += 1
                 num_clips = 1
 
             # Mark as processed
