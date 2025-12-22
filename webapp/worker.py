@@ -3,6 +3,8 @@ import numpy as np
 import tensorflow as tf
 from microesc import keras
 from microesc.datasets.AugmentedDirectoryDataSet import AugmentedDirectoryDataSet
+from microesc.datasets.DirectoryDataSet import AudioClip
+from microesc.detection.SpectralFluxDetector import SpectralFluxDetector
 from microesc.classification.Yamnet import YamnetParams
 from microesc.classification.yamnetmini import build_mini_yamnet_model, DEFAULT_BLOCKS
 from microesc.classification.training import (
@@ -68,43 +70,154 @@ def add_file(file_obj, label, is_background, metadata_text):
         if target_file is None:
             raise ValueError("No file provided.")
 
+        dest = None
+
         ext = os.path.splitext(target_file.name)[1].lower()
         if ext not in (".wav", ".flac", ".ogg", ".mp3", ".m4a"):
             raise ValueError("Unsupported file type.")
 
-        label_dir = os.path.join(config.UPLOAD_ROOT, label if not is_background else "__background__")
-        os.makedirs(label_dir, exist_ok=True)
-        
-        filename = f"{uuid.uuid4().hex}{ext}"
-        dest = os.path.join(label_dir, filename)
-        shutil.copy(target_file.name, dest)
+        try:
+            label_dir = os.path.join(config.UPLOAD_ROOT, label if not is_background else "__background__")
+            os.makedirs(label_dir, exist_ok=True)
 
-        # Convert to WAV if necessary (use ffmpeg for broad container/codec support)
-        if ext != ".wav":
-            global_state.log(f"Converting {dest} to WAV format using ffmpeg.")
-            try:
-                dest = convert_to_wav(dest, config.TARGET_SAMPLE_RATE, remove_original=True)
-                global_state.log(f"Converted to WAV: {dest}")
-            except Exception as e:
-                raise ValueError(f"Audio conversion failed: {e}")
+            filename = f"{uuid.uuid4().hex}{ext}"
+            dest = os.path.join(label_dir, filename)
+            shutil.copy(target_file.name, dest)
 
-        if metadata_text:
+            # Convert to WAV if necessary (use ffmpeg for broad container/codec support)
+            if ext != ".wav":
+                global_state.log(f"Converting {dest} to WAV format using ffmpeg.")
+                try:
+                    dest = convert_to_wav(dest, config.TARGET_SAMPLE_RATE, remove_original=True)
+                    global_state.log(f"Converted to WAV: {dest}")
+                except Exception as e:
+                    raise ValueError(f"Audio conversion failed: {e}")
+
+            # Check if already processed
+            if dest in global_state.processed_files:
+                base_name = os.path.basename(target_file.name)
+                return f"{base_name}: Already processed (skipped)"
+
+            target_label = label if not is_background else "None"
             meta_path = os.path.splitext(dest)[0] + ".meta"
-            with open(meta_path, "w") as f:
-                f.write(metadata_text)
-                
-        target_label = label if not is_background else "None"
-        global_state.dataset.add_class_from_directory(
-            label=target_label,
-            path=label_dir,
-            target_sample_rate_hz=config.TARGET_SAMPLE_RATE,
-            target_clip_length=config.TARGET_CLIP_LENGTH,
-            use_metadata=True,
-            resplit=True
-        )
 
-        base_name = os.path.basename(target_file.name)
-        return f"{base_name}: Added file to label '{target_label}'"
+            # Handle metadata: either provided by user or auto-generate with event detector
+            if metadata_text:
+                # User provided metadata
+                with open(meta_path, "w") as f:
+                    f.write(metadata_text)
+                use_metadata = True
+            elif global_state.detector_config.get('enabled', False) and global_state.detector_config.get('type') == 'spectral_flux':
+                # Auto-generate metadata using event detector
+                global_state.log(f"Running event detection on {os.path.basename(dest)}...")
+                detector = SpectralFluxDetector(
+                    global_state.detector_config.get('threshold', config.DEFAULT_DETECTOR_THRESHOLD),
+                    config.TARGET_SAMPLE_RATE,
+                    config.DEFAULT_FFT_LENGTH,
+                    config.DEFAULT_HOP_LENGTH,
+                    False,
+                    config.DEFAULT_MIN_FREQ,
+                    config.DEFAULT_MAX_FREQ,
+                    global_state.detector_config.get('min_gap', config.DEFAULT_DETECTOR_MIN_GAP)
+                )
+
+                try:
+                    wav, _ = librosa.load(dest, sr=config.TARGET_SAMPLE_RATE, mono=True)
+                    event_times = detector.find_events(wav)
+
+                    # Write metadata file
+                    with open(meta_path, "w") as f:
+                        for t in event_times:
+                            f.write(f"{t:.6f},{target_label}\n")
+
+                    global_state.log(f"Detected {len(event_times)} events in {os.path.basename(dest)}")
+                    use_metadata = True
+                except Exception as e:
+                    global_state.log(f"Event detection failed: {e}. Using full file.")
+                    use_metadata = False
+            else:
+                # No metadata, no event detection - use full file
+                use_metadata = False
+
+            # Add to dataset using add_clips_for_label for efficiency (avoids directory rescan)
+            # We'll manually create clips and add them
+            if use_metadata and os.path.exists(meta_path):
+                # Load metadata and create clips
+                clips_to_add = []
+                with open(meta_path, 'r') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        parts = line.rsplit(',', 1)
+                        if len(parts) == 2:
+                            try:
+                                start_time = float(parts[0])
+                                clip_label = parts[1].strip()
+                                if clip_label.lower() in ('ignore', 'unknown'):
+                                    continue
+
+                                # Ensure label exists in dataset
+                                if clip_label not in global_state.dataset.label_to_idx:
+                                    idx = len(global_state.dataset.label_to_idx)
+                                    global_state.dataset.label_to_idx[clip_label] = idx
+                                    global_state.dataset.idx_to_label[idx] = clip_label
+                                    global_state.dataset.label_counts[clip_label] = 0
+
+                                label_idx = global_state.dataset.label_to_idx[clip_label]
+                                end_time = start_time + config.TARGET_CLIP_LENGTH
+
+                                clip = AudioClip(
+                                    label_idx=label_idx,
+                                    label=clip_label,
+                                    path=dest,
+                                    start_seconds=start_time,
+                                    end_seconds=end_time,
+                                    target_sample_rate_hz=config.TARGET_SAMPLE_RATE
+                                )
+                                clips_to_add.append(clip)
+                                global_state.dataset.label_counts[clip_label] += 1
+                            except ValueError:
+                                continue
+
+                if clips_to_add:
+                    global_state.dataset.add_clips_for_label(target_label, clips_to_add, is_background=is_background, resplit=False)
+                    num_clips = len(clips_to_add)
+            else:
+                # No metadata - add entire file as single clip
+                if target_label not in global_state.dataset.label_to_idx:
+                    idx = len(global_state.dataset.label_to_idx)
+                    global_state.dataset.label_to_idx[target_label] = idx
+                    global_state.dataset.idx_to_label[idx] = target_label
+                    global_state.dataset.label_counts[target_label] = 0
+
+                label_idx = global_state.dataset.label_to_idx[target_label]
+                clip = AudioClip(
+                    label_idx=label_idx,
+                    label=target_label,
+                    path=dest,
+                    start_seconds=0.0,
+                    end_seconds=config.TARGET_CLIP_LENGTH,
+                    target_sample_rate_hz=config.TARGET_SAMPLE_RATE
+                )
+                global_state.dataset.add_clips_for_label(target_label, [clip], is_background=is_background, resplit=False)
+                global_state.dataset.label_counts[target_label] += 1
+                num_clips = 1
+
+            # Mark as processed
+            if dest:
+                global_state.processed_files.add(dest)
+
+            base_name = os.path.basename(target_file.name)
+            return f"{base_name}: Added {num_clips} clip(s) to label '{target_label}'"
+        except Exception:
+            # Cleanup partial file if something went wrong
+            try:
+                if dest and os.path.exists(dest):
+                    os.remove(dest)
+            except Exception:
+                pass
+            raise
 
     if isinstance(file_obj, (list, tuple)):
         messages = []
@@ -157,7 +270,8 @@ def train_model(train_params):
             )
             global_state.log(f"Added {num_added} background samples as 'None' class")
 
-        # Perform the train/test split after any background additions
+        # Perform the train/test split once at training time (deferred from file uploads)
+        global_state.log("Splitting dataset into train/test...")
         dataset._split_train_test()
         
         batch_size = train_params.get('batch_size', config.DEFAULT_BATCH_SIZE)

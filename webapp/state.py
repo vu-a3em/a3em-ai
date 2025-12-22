@@ -11,6 +11,13 @@ class AppState:
         self.training_log = []
         self.lock = threading.Lock()
         self.roc_curve = [] # List of (t, tpr, fpr)
+        self.processed_files = set() # Track processed file paths to avoid duplicates
+        self.detector_config = {
+            'enabled': True,
+            'type': 'spectral_flux',
+            'threshold': 9.0,
+            'min_gap': 0.1
+        }
 
     def log(self, message):
         with self.lock:

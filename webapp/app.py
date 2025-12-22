@@ -16,9 +16,15 @@ def get_dataset_summary():
     df = pd.DataFrame(list(counts.items()), columns=["Label", "Count"])
     return df
 
-def upload_file_handler(file_obj, label, is_background, metadata):
+def upload_file_handler(file_obj, label, is_background, metadata, det_enabled, det_type, det_threshold, det_min_gap):
     if not file_obj:
         return "No files selected.", get_dataset_summary()
+    
+    # Update global detector config
+    global_state.detector_config['enabled'] = det_enabled
+    global_state.detector_config['type'] = 'spectral_flux' if det_type == "Spectral Flux" else None
+    global_state.detector_config['threshold'] = det_threshold
+    global_state.detector_config['min_gap'] = det_min_gap
 
     msg = worker.add_file(file_obj, label, is_background, metadata)
     return msg, get_dataset_summary()
@@ -85,6 +91,13 @@ with gr.Blocks(title="A3EM AI Trainer") as demo:
                 label_in = gr.Textbox(label="Label")
                 is_bg_in = gr.Checkbox(label="Is Background/None")
                 meta_in = gr.TextArea(label="Metadata (CSV: timestamp,label)", placeholder="6.725604,Unknown\n6.803292,Fireworks")
+                
+                with gr.Accordion("Event Detection Settings", open=False):
+                    detector_enabled = gr.Checkbox(label="Enable Event Detection", value=True, info="Auto-detect events when no metadata provided")
+                    detector_type = gr.Dropdown(["Spectral Flux"], value="Spectral Flux", label="Detector Type")
+                    detector_threshold = gr.Slider(1.0, 20.0, value=config.DEFAULT_DETECTOR_THRESHOLD, label="Detection Threshold")
+                    detector_min_gap = gr.Slider(0.01, 1.0, value=config.DEFAULT_DETECTOR_MIN_GAP, label="Min Gap Between Events (s)")
+                
                 upload_btn = gr.Button("Upload & Add")
                 upload_msg = gr.Textbox(label="Status")
             
@@ -92,7 +105,9 @@ with gr.Blocks(title="A3EM AI Trainer") as demo:
                 summary_table = gr.Dataframe(label="Dataset Summary")
                 refresh_btn = gr.Button("Refresh Summary")
         
-        upload_btn.click(upload_file_handler, inputs=[file_in, label_in, is_bg_in, meta_in], outputs=[upload_msg, summary_table])
+        upload_btn.click(upload_file_handler, 
+                        inputs=[file_in, label_in, is_bg_in, meta_in, detector_enabled, detector_type, detector_threshold, detector_min_gap], 
+                        outputs=[upload_msg, summary_table])
         refresh_btn.click(get_dataset_summary, outputs=summary_table)
 
     with gr.Tab("Training Configuration"):

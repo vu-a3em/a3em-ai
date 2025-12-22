@@ -49,7 +49,10 @@ evals = []
 
 # Create the full audio dataset and split it into a training and testing dataset
 dataset_path = '/isis/home/steing/AIDataSet'
-event_detector = SpectralFluxDetector(9.0, 8000, 512, 256, False, 150.0, 1800.0, 0.100)
+event_detector = SpectralFluxDetector(
+  threshold=9.0, 
+  sample_rate=8000,
+  fft_length=512, hop_length=256, use_power_spectrum=False, min_frequency=150.0, max_frequency=1800.0, min_seconds_between_events=0.100)
 
 # Get all class names from the dataset directory, excluding ignored directories and background classes
 all_classes = [d for d in os.listdir(dataset_path) if os.path.isdir(os.path.join(dataset_path, d))]
