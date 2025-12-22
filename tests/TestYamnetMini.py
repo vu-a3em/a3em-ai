@@ -6,11 +6,12 @@ from microesc.detection.SpectralFluxDetector import SpectralFluxDetector
 from microesc import keras
 import tensorflow_model_optimization as tfmot
 import microesc.tools as tools
+from microesc.classification.training import TrainingConfig, generate_embedding_dataset, build_classifier_head
 import itertools
 import tensorflow as tf
 import numpy as np
 
-from microesc.classification.yamnetmini import build_mini_yamnet_model
+from microesc.classification.yamnetmini import build_mini_yamnet_model, DEFAULT_BLOCKS
 
 #set seed for reproducibility
 tf.random.set_seed(42)
@@ -26,64 +27,8 @@ background_classes = ['Noise', 'VehicleExhaust', 'Wind']
 params = YamnetParams()
 params.num_classes = 38 - len(ignore_dirs) 
 
-blocks = [
-  # Full
-  # [
-  #   (64, [3, 3], 1),
-  #   (128, [3, 3], 2),
-  #   (128, [3, 3], 1),
-  #   (256, [3, 3], 2),
-  #   (256, [3, 3], 1),
-  #   (512, [3, 3], 2),
-  #   (512, [3, 3], 1),
-  #   (512, [3, 3], 1),
-  #   (512, [3, 3], 1),
-  #   (512, [3, 3], 1),
-  #   (512, [3, 3], 1),
-  #   (1024, [3, 3], 2),
-  #   (1024, [3, 3], 1),
-  # ],
-  # # Larger
-  # [
-  #   (64, [3, 3], 1),
-  #   (128, [3, 3], 2),
-  #   (128, [3, 3], 1),
-  #   (256, [3, 3], 2),
-  #   (256, [3, 3], 1),
-  #   (512, [3, 3], 2),
-  #   (512, [3, 3], 1),
-  #   (1024, [3, 3], 2),
-  # ],
-  # # Original
-  # [
-  #   (64, [3, 3], 1),
-  #   (128, [3, 3], 2),
-  #   (128, [3, 3], 1),
-  #   (256, [3, 3], 2),
-  #   (256, [3, 3], 1),
-  #   (512, [3, 3], 2),
-  # ],
-  # # Smaller
-    (64, [3, 3], 1),
-    (128, [3, 3], 2),
-    (128, [3, 3], 1),
-    (256, [3, 3], 2),
-    (256, [3, 3], 1),
-  # Even smaller
-  # [
-  #   (64, [3, 3], 1),
-  #   (128, [3, 3], 2),
-  #   (128, [3, 3], 1),
-  #   (256, [3, 3], 2),
-  # ]
-  # Tiny
-  # [
-  #   (64, [3, 3], 1),
-  #   (128, [3, 3], 2),
-  #   (128, [3, 3], 1),
-  # ]
-]
-
+# Use default blocks from shared module
+blocks = DEFAULT_BLOCKS
 dense_units = []
 
 evals = []
@@ -160,60 +105,35 @@ else:
 # Pop off dense layer
 model.pop()
 
-# Use model for feature extraction on entire dataset
-# Preprocess the datasets to extract embeddings using the frozen Yamnet model
-def extract_yamnet_embeddings(waveforms, labels):
-  embeddings = model(waveforms, training=False)
-  return embeddings, labels
-
-# Generate embeddings to numpy arrays once, then create new tf.data.Dataset objects
-def generate_embedding_dataset(seq):
-  """Takes a KerasDataSet (keras.utils.Sequence) and returns (X, y) numpy arrays of embeddings and labels."""
-  embs = []
-  lbls = []
-  for i in range(len(seq)):
-    batch_waveforms, batch_labels = seq[i]
-    batch_embs = model(batch_waveforms, training=False)
-    # Convert to numpy if it's a Tensor
-    if hasattr(batch_embs, 'numpy'):
-      batch_embs = batch_embs.numpy()
-    embs.append(batch_embs)
-    lbls.append(batch_labels)
-  X = np.concatenate(embs, axis=0) if len(embs) > 0 else np.empty((0,) + model.output.shape[1:], dtype=np.float32)
-  y = np.concatenate(lbls, axis=0) if len(lbls) > 0 else np.empty((0,), dtype=np.int64)
-  return X, y
-
-# Precompute and rebuild datasets
-X_train, y_train = generate_embedding_dataset(train_ds)
-X_test, y_test = generate_embedding_dataset(test_ds)
+# Precompute and rebuild datasets using shared utility
+X_train, y_train = generate_embedding_dataset(train_ds, model)
+X_test, y_test = generate_embedding_dataset(test_ds, model)
 
 train_ds = tf.data.Dataset.from_tensor_slices((X_train, y_train)).shuffle(len(y_train) if len(y_train) > 0 else 1).batch(batch_size).prefetch(tf.data.AUTOTUNE)
 test_ds = tf.data.Dataset.from_tensor_slices((X_test, y_test)).batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
-# Create new classifier model for the extracted features
-classifier = keras.Sequential([
-    keras.layers.Input(shape=model.output.shape[1:], dtype='float32'),
-    keras.layers.Dense(units=256, use_bias=True, activation='relu'),
-    keras.layers.Dropout(0.25),
-    keras.layers.Dense(units=128, use_bias=True, activation='relu'),
-    keras.layers.Dropout(0.25),
-    keras.layers.Dense(units=params.num_classes, use_bias=True, activation=params.classifier_activation)
-])
-lr_schedule = keras.callbacks.ReduceLROnPlateau(
-    monitor='val_loss',
-    factor=0.5,
-    patience=5,
-    min_lr=1e-7,
-    verbose=1
+# Create new classifier model using shared utility
+training_config = TrainingConfig(
+    batch_size=batch_size,
+    learning_rate=1e-4,
+    epochs=10000,
+    patience=10,
+    dropout=0.25,
+    hidden_units=[256, 128],
+    activation='relu'
 )
-callback = keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
 
-classifier.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-4),
+classifier = build_classifier_head(model.output.shape[1:], params.num_classes, training_config)
+
+lr_schedule = training_config.create_lr_schedule('plateau', factor=0.5, schedule_patience=5, min_lr=1e-7)
+callback = keras.callbacks.EarlyStopping(monitor='val_loss', patience=training_config.patience, restore_best_weights=True)
+
+classifier.compile(optimizer=keras.optimizers.Adam(learning_rate=training_config.learning_rate),
               loss=keras.losses.SparseCategoricalCrossentropy(),
               metrics=[keras.metrics.SparseCategoricalAccuracy()])
 classifier.summary()
 
-classifier.fit(train_ds, epochs=10000, validation_data=test_ds, callbacks=[callback, lr_schedule], verbose=2)
+classifier.fit(train_ds, epochs=training_config.epochs, validation_data=test_ds, callbacks=[callback, lr_schedule], verbose=2)
 val_eval = classifier.evaluate(test_ds, return_dict=True)
 print(f"Yamnet-Mini + classifier achieved test accuracy {val_eval['sparse_categorical_accuracy']*100:.2f}%")
 

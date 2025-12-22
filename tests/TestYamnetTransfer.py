@@ -4,6 +4,7 @@ from microesc.detection.SpectralFluxDetector import SpectralFluxDetector
 from microesc import keras
 import tensorflow_model_optimization as tfmot
 import microesc.tools as tools
+from microesc.classification.training import TrainingConfig, generate_embedding_dataset, build_classifier_head
 import tensorflow as tf
 import numpy as np
 
@@ -23,38 +24,22 @@ model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-4),  # type: igno
               metrics=[keras.metrics.SparseCategoricalAccuracy()])
 model.summary()
 
-classifier = keras.Sequential(name='Yamnet_Transfer_Classifier')
-classifier.add(keras.Input(shape=model.output.shape[1:]))
-
-# classifier.add(keras.layers.DepthwiseConv2D(kernel_size=[3, 3], strides=2, depth_multiplier=1, padding=params.conv_padding, use_bias=False))
-# classifier.add(keras.layers.BatchNormalization(center=params.batchnorm_center, scale=params.batchnorm_scale, epsilon=params.batchnorm_epsilon))
-# classifier.add(keras.layers.ReLU(max_value=6.0))
-# classifier.add(keras.layers.Conv2D(filters=1024, kernel_size=[1, 1], strides=1, padding=params.conv_padding, use_bias=False))
-# classifier.add(keras.layers.BatchNormalization(center=params.batchnorm_center, scale=params.batchnorm_scale, epsilon=params.batchnorm_epsilon))
-# classifier.add(keras.layers.ReLU(max_value=6.0))
-
-# classifier.add(keras.layers.DepthwiseConv2D(kernel_size=[3, 3], strides=1, depth_multiplier=1, padding=params.conv_padding, use_bias=False))
-# classifier.add(keras.layers.BatchNormalization(center=params.batchnorm_center, scale=params.batchnorm_scale, epsilon=params.batchnorm_epsilon))
-# classifier.add(keras.layers.ReLU(max_value=6.0))
-# classifier.add(keras.layers.Conv2D(filters=1024, kernel_size=[1, 1], strides=1, padding=params.conv_padding, use_bias=False))
-# classifier.add(keras.layers.BatchNormalization(center=params.batchnorm_center, scale=params.batchnorm_scale, epsilon=params.batchnorm_epsilon))
-# classifier.add(keras.layers.ReLU(max_value=6.0))
-# classifier.add(keras.layers.GlobalAveragePooling2D())
-
-# classifier.add(keras.layers.Dense(128, activation='relu',
-#                                   kernel_regularizer=keras.regularizers.l2(1e-4), use_bias=False))
-# classifier.add(keras.layers.BatchNormalization(center=True, scale=True, epsilon=params.batchnorm_epsilon))
-# classifier.add(keras.layers.Dropout(0.3))
-
-classifier.add(keras.layers.Dense(params.num_classes, activation='softmax', use_bias=True))
-
-initial_lr = 2e-4
-decay_steps = 3000  # You may tune this value based on your dataset size/epochs
-lr_schedule = keras.optimizers.schedules.CosineDecay(
-  initial_learning_rate=initial_lr,
-  decay_steps=decay_steps,
-  alpha=1e-2  # Final learning rate as a fraction of initial_lr
+# Build classifier using shared utility
+training_config = TrainingConfig(
+    batch_size=32,
+    learning_rate=2e-4,
+    epochs=10000,
+    patience=10,
+    dropout=0.0,
+    hidden_units=[],  # Single dense layer only
+    activation='relu'
 )
+
+# Create cosine decay LR schedule
+lr_schedule = training_config.create_lr_schedule('cosine', decay_steps=3000, alpha=1e-2)
+
+classifier = build_classifier_head(model.output.shape[1:], params.num_classes, training_config)
+
 classifier.compile(
   optimizer=keras.optimizers.Adam(learning_rate=lr_schedule),  # type: ignore
   loss=keras.losses.SparseCategoricalCrossentropy(),
@@ -74,39 +59,17 @@ train_ds = dataset.train_dataset(batch_size=batch_size)
 test_ds = dataset.test_dataset(batch_size=batch_size)
 dataset.summary()
 
-# Preprocess the datasets to extract embeddings using the frozen Yamnet model
-def extract_yamnet_embeddings(waveforms, labels):
-  embeddings = model(waveforms, training=False)
-  return embeddings, labels
-
-# Generate embeddings to numpy arrays once, then create new tf.data.Dataset objects
-def generate_embedding_dataset(seq):
-  """Takes a KerasDataSet (keras.utils.Sequence) and returns (X, y) numpy arrays of embeddings and labels."""
-  embs = []
-  lbls = []
-  for i in range(len(seq)):
-    batch_waveforms, batch_labels = seq[i]
-    batch_embs = model(batch_waveforms, training=False)
-    # Convert to numpy if it's a Tensor
-    if hasattr(batch_embs, 'numpy'):
-      batch_embs = batch_embs.numpy()
-    embs.append(batch_embs)
-    lbls.append(batch_labels)
-  X = np.concatenate(embs, axis=0) if len(embs) > 0 else np.empty((0,) + model.output.shape[1:], dtype=np.float32)
-  y = np.concatenate(lbls, axis=0) if len(lbls) > 0 else np.empty((0,), dtype=np.int64)
-  return X, y
-
-# Precompute and rebuild datasets
-X_train, y_train = generate_embedding_dataset(train_ds)
-X_test, y_test = generate_embedding_dataset(test_ds)
+# Precompute and rebuild datasets using shared utility
+X_train, y_train = generate_embedding_dataset(train_ds, model)
+X_test, y_test = generate_embedding_dataset(test_ds, model)
 
 train_ds = tf.data.Dataset.from_tensor_slices((X_train, y_train)).shuffle(len(y_train) if len(y_train) > 0 else 1).batch(batch_size).prefetch(tf.data.AUTOTUNE)
 test_ds = tf.data.Dataset.from_tensor_slices((X_test, y_test)).batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
 
 # Train and save the best model
-callback = keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
-history: keras.callbacks.History = classifier.fit(train_ds, epochs=10000, validation_data=test_ds, callbacks=[callback], verbose=2)  # type: ignore
+callback = keras.callbacks.EarlyStopping(monitor='val_loss', patience=training_config.patience, restore_best_weights=True)
+history: keras.callbacks.History = classifier.fit(train_ds, epochs=training_config.epochs, validation_data=test_ds, callbacks=[callback], verbose=2)  # type: ignore
 classifier.evaluate(test_ds, return_dict=True)
 tools.plot_training_history(history)
 tools.plot_confusion_matrix(classifier, test_ds, dataset.idx_to_label)
