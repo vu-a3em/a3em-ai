@@ -29,7 +29,7 @@ def upload_file_handler(file_obj, label, is_background, metadata, det_enabled, d
     msg = worker.add_file(file_obj, label, is_background, metadata)
     return msg, get_dataset_summary()
 
-def start_training_handler(split, batch_size, epochs, lr, hidden_units_str, activation, dropout, target_fpr, none_cap):
+def start_training_handler(split, batch_size, epochs, lr, hidden_units_str, activation, dropout, target_fpr, none_cap, balance):
     if global_state.training_status == "Training":
         return "Training already in progress."
     
@@ -49,6 +49,8 @@ def start_training_handler(split, batch_size, epochs, lr, hidden_units_str, acti
         'target_fpr': target_fpr
         , 'none_cap': int(none_cap) if none_cap and int(none_cap) > 0 else None
     }
+    # Default: do not perform balancing unless requested via UI checkbox
+    params['balance'] = bool(balance)
     
     t = threading.Thread(target=worker.train_model, args=(params,))
     t.start()
@@ -117,6 +119,7 @@ with gr.Blocks(title="A3EM AI Trainer") as demo:
                 batch_slider = gr.Slider(8, 128, value=config.DEFAULT_BATCH_SIZE, step=8, label="Batch Size")
                 epochs_slider = gr.Slider(10, 500, value=config.DEFAULT_EPOCHS, label="Epochs")
                 lr_slider = gr.Slider(1e-5, 1e-2, value=config.DEFAULT_LEARNING_RATE, label="Learning Rate")
+                balance_checkbox = gr.Checkbox(label="Balance classes (upsample at train time)", value=False)
             
             with gr.Column():
                 hidden_in = gr.Textbox(value="256, 128", label="Hidden Units (comma separated)")
@@ -130,8 +133,8 @@ with gr.Blocks(title="A3EM AI Trainer") as demo:
         log_txt = gr.TextArea(label="Training Log", lines=10, max_lines=20)
             
         train_btn.click(start_training_handler, 
-                        inputs=[split_slider, batch_slider, epochs_slider, lr_slider, hidden_in, act_drop, drop_slider, fpr_slider, none_cap],
-                        outputs=status_txt)
+            inputs=[split_slider, batch_slider, epochs_slider, lr_slider, hidden_in, act_drop, drop_slider, fpr_slider, none_cap, balance_checkbox],
+            outputs=status_txt)
             
         # Manual refresh for logs (auto-refresh 'every' kwarg not supported in this version)
         refresh_logs_btn = gr.Button("Refresh Logs & Status")

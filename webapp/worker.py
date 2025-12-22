@@ -31,7 +31,7 @@ def init_system():
             target_sample_rate_hz=config.TARGET_SAMPLE_RATE,
             target_clip_length=config.TARGET_CLIP_LENGTH,
             training_split_percent=config.DEFAULT_TRAIN_SPLIT,
-            uniform_classes_per_batch=True,
+            uniform_classes_per_batch=False,  # defer balancing until training if requested
             background_classes=[], # Will be updated dynamically via uploads
             use_metadata=True
         )
@@ -190,10 +190,22 @@ def add_file(file_obj, label, is_background, metadata_text):
                     for c in clips_to_add:
                         grouped.setdefault(c.label, []).append(c)
                     num_clips = 0
+                    # Log pre-add counts
+                    pre_counts = {lbl: global_state.dataset.label_counts.get(lbl, 0) for lbl in grouped.keys()}
+                    global_state.log(f"Pre-add label counts: {pre_counts}")
                     for lbl, group in grouped.items():
                         # Ensure label exists in dataset mapping (add_clips_for_label will also ensure this)
-                        global_state.dataset.add_clips_for_label(lbl, group, is_background=is_background, resplit=False)
-                        num_clips += len(group)
+                        # Temporarily disable uniform augmentation during incremental upload to avoid altering other labels
+                        old_uniform = getattr(global_state.dataset, 'uniform_classes_per_batch', False)
+                        try:
+                            global_state.dataset.uniform_classes_per_batch = False
+                            global_state.dataset.add_clips_for_label(lbl, group, is_background=is_background, resplit=False)
+                        finally:
+                            global_state.dataset.uniform_classes_per_batch = old_uniform
+                        added = len(group)
+                        num_clips += added
+                        post = global_state.dataset.label_counts.get(lbl, 0)
+                        global_state.log(f"Added {added} clip(s) to label '{lbl}' (now {post})")
             else:
                 # No metadata - add entire file as single clip
                 if target_label not in global_state.dataset.label_to_idx:
@@ -211,7 +223,18 @@ def add_file(file_obj, label, is_background, metadata_text):
                     end_seconds=config.TARGET_CLIP_LENGTH,
                     target_sample_rate_hz=config.TARGET_SAMPLE_RATE
                 )
-                global_state.dataset.add_clips_for_label(target_label, [clip], is_background=is_background, resplit=False)
+                # Log pre-add count for single clip
+                pre_single = global_state.dataset.label_counts.get(target_label, 0)
+                global_state.log(f"Pre-add single clip count for '{target_label}': {pre_single}")
+                # Temporarily disable uniform augmentation during incremental upload
+                old_uniform = getattr(global_state.dataset, 'uniform_classes_per_batch', False)
+                try:
+                    global_state.dataset.uniform_classes_per_batch = False
+                    global_state.dataset.add_clips_for_label(target_label, [clip], is_background=is_background, resplit=False)
+                finally:
+                    global_state.dataset.uniform_classes_per_batch = old_uniform
+                post_single = global_state.dataset.label_counts.get(target_label, 0)
+                global_state.log(f"Added 1 clip to '{target_label}' (now {post_single})")
                 num_clips = 1
 
             # Mark as processed
@@ -280,7 +303,16 @@ def train_model(train_params):
             )
             global_state.log(f"Added {num_added} background samples as 'None' class")
 
-        # Perform the train/test split once at training time (deferred from file uploads)
+        # Set balancing behavior from training params and perform augmentation if requested
+        balance = train_params.get('balance', False)
+        dataset.uniform_classes_per_batch = bool(balance)
+        if dataset.uniform_classes_per_batch:
+            try:
+                global_state.log("Applying uniform class augmentation before split...")
+                dataset._augment_uniform_classes()
+            except Exception as e:
+                global_state.log(f"Uniform augmentation failed: {e}")
+
         global_state.log("Splitting dataset into train/test...")
         dataset._split_train_test()
         
