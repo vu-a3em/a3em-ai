@@ -265,7 +265,7 @@ with gr.Blocks(title="A3EM AI Trainer") as demo:
                 act_drop = gr.Dropdown(["relu", "gelu", "swish"], value="gelu", label="Activation")
                 drop_slider = gr.Slider(0.0, 0.5, value=0.25, label="Dropout")
                 fpr_slider = gr.Slider(0.01, 0.5, value=0.10, label="Target FPR (for None threshold)")
-                none_cap = gr.Number(value=0, label="Max 'None' samples to use (0=disabled)")
+                none_cap = gr.Number(value=100, label="Max 'None' samples to use (0=disabled)")
         
         train_btn = gr.Button("Start Training", variant="primary")
         status_txt = gr.Textbox(label="Training Status")
