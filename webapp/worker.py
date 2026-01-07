@@ -736,3 +736,28 @@ def evaluate_test_set(audio_files, metadata_files):
     }
     
     return global_state.evaluation_metrics
+
+
+def save_trained_model():
+    """
+    Save the trained classifier model to a file.
+    
+    Returns:
+        Path to saved model file, or error message
+    """
+    if global_state.classifier is None:
+        return None, "No trained model available."
+    
+    try:
+        import time
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        model_path = f"/tmp/a3em_classifier_{timestamp}.keras"
+        
+        global_state.classifier.save(model_path)
+        global_state.log(f"Model saved to {model_path}")
+        
+        return model_path, f"Model saved successfully"
+    except Exception as e:
+        error_msg = f"Error saving model: {str(e)}"
+        global_state.log(error_msg)
+        return None, error_msg

@@ -79,6 +79,10 @@ def get_roc_plot():
     plt.grid(True)
     return fig
 
+def download_model_handler():
+    model_path, status = worker.save_trained_model()
+    return model_path, status
+
 def predict_handler(audio, metadata, det_enabled, det_threshold, det_min_gap, use_manual, threshold):
     if not audio:
         return pd.DataFrame(), "No audio file provided."
@@ -266,11 +270,18 @@ with gr.Blocks(title="A3EM AI Trainer") as demo:
         train_btn = gr.Button("Start Training", variant="primary")
         status_txt = gr.Textbox(label="Training Status")
         log_txt = gr.TextArea(label="Training Log", lines=10, max_lines=20)
+        
+        with gr.Row():
+            download_btn = gr.Button("Download Trained Model")
+            download_file = gr.File(label="Model File", visible=False)
+            download_status = gr.Textbox(label="Download Status")
             
         train_btn.click(start_training_handler, 
             inputs=[split_slider, batch_slider, epochs_slider, lr_slider, hidden_in, act_drop, drop_slider, fpr_slider, none_cap, balance_checkbox],
             outputs=status_txt)
             
+        download_btn.click(download_model_handler, outputs=[download_file, download_status])
+        
         # Manual refresh for logs (auto-refresh 'every' kwarg not supported in this version)
         refresh_logs_btn = gr.Button("Refresh Logs & Status")
         refresh_logs_btn.click(get_log_handler, None, log_txt)
