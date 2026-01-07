@@ -272,9 +272,9 @@ with gr.Blocks(title="A3EM AI Trainer") as demo:
         log_txt = gr.TextArea(label="Training Log", lines=10, max_lines=20)
         
         with gr.Row():
-            download_btn = gr.Button("Download Trained Model")
+            download_btn = gr.Button("Save Trained Model")
             download_file = gr.File(label="Model File", visible=False)
-            download_status = gr.Textbox(label="Download Status")
+            download_status = gr.Textbox(label="Model Save Status")
             
         train_btn.click(start_training_handler, 
             inputs=[split_slider, batch_slider, epochs_slider, lr_slider, hidden_in, act_drop, drop_slider, fpr_slider, none_cap, balance_checkbox],
