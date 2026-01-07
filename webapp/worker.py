@@ -480,6 +480,9 @@ def predict(audio_file, threshold_override=None, metadata_text=None):
         # Load full audio
         wav, sr = librosa.load(tmp_path, sr=config.TARGET_SAMPLE_RATE)
         
+        # Cache for visualization
+        global_state.last_audio_data = (wav.copy(), sr)
+        
         # Get event timestamps
         event_times = []
         

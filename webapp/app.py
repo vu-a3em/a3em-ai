@@ -109,6 +109,70 @@ def adjust_threshold_handler(threshold):
     
     return df
 
+def create_waveform_plot():
+    """Create waveform visualization with event markers."""
+    if not global_state.last_audio_data or not global_state.last_inference_results:
+        return None
+    
+    try:
+        # Get cached audio data
+        wav, sr = global_state.last_audio_data
+        duration = len(wav) / sr
+        
+        # Downsample waveform for display if longer than 2 minutes
+        max_display_samples = sr * 120  # 2 minutes at full resolution
+        if len(wav) > max_display_samples:
+            downsample_factor = int(np.ceil(len(wav) / max_display_samples))
+            wav_display = wav[::downsample_factor]
+            time_display = np.arange(len(wav_display)) * downsample_factor / sr
+        else:
+            wav_display = wav
+            time_display = np.arange(len(wav)) / sr
+        
+        # Create figure
+        fig, ax = plt.subplots(figsize=(14, 4))
+        ax.plot(time_display, wav_display, color='steelblue', linewidth=0.5, alpha=0.7)
+        ax.set_xlabel('Time (s)')
+        ax.set_ylabel('Amplitude')
+        ax.set_title(f'Audio Waveform with Detected Events ({duration:.1f}s total)')
+        ax.grid(True, alpha=0.3)
+        
+        # Get unique labels for color mapping
+        labels_in_results = list(set(r[1] for r in global_state.last_inference_results))
+        colors = plt.cm.tab10(np.linspace(0, 1, len(labels_in_results)))
+        label_to_color = {label: colors[i] for i, label in enumerate(labels_in_results)}
+        
+        # Add event markers
+        y_min, y_max = ax.get_ylim()
+        y_range = y_max - y_min
+        label_y = y_max - y_range * 0.1  # Position labels near top
+        
+        for timestamp, label, confidence in global_state.last_inference_results:
+            if not isinstance(timestamp, (int, float)):
+                continue
+                
+            color = label_to_color.get(label, 'red')
+            
+            # Vertical line
+            ax.axvline(x=timestamp, color=color, linestyle='--', linewidth=1.5, alpha=0.7)
+            
+            # Label with confidence
+            ax.text(timestamp, label_y, f'{label}\n{confidence:.2f}', 
+                    rotation=45, ha='left', va='bottom', fontsize=8,
+                    bbox=dict(boxstyle='round,pad=0.3', facecolor=color, alpha=0.6))
+        
+        # Add legend
+        from matplotlib.patches import Patch
+        legend_elements = [Patch(facecolor=label_to_color[label], label=label) 
+                          for label in labels_in_results]
+        ax.legend(handles=legend_elements, loc='upper right', fontsize=9)
+        
+        plt.tight_layout()
+        return fig
+    except Exception as e:
+        print(f"Error creating waveform plot: {e}")
+        return None
+
 def evaluate_handler(audio_files, metadata_text):
     if not audio_files or not metadata_text:
         return None, pd.DataFrame(), "No test data provided."
@@ -238,7 +302,11 @@ with gr.Blocks(title="A3EM AI Trainer") as demo:
                         
                         predict_btn = gr.Button("Predict Events", variant="primary")
                         status_infer = gr.Textbox(label="Status")
-                    
+                
+                # Waveform visualization (full width)
+                waveform_plot = gr.Plot(label="Audio Waveform with Detected Events")
+                
+                with gr.Row():
                     with gr.Column():
                         results_table = gr.Dataframe(
                             label="Event Predictions",
@@ -256,17 +324,27 @@ with gr.Blocks(title="A3EM AI Trainer") as demo:
                         export_btn = gr.Button("Export Results as CSV")
                         export_file = gr.File(label="Download CSV", visible=False)
                 
+                def predict_with_plot(audio, metadata, det_enabled, det_threshold, det_min_gap, use_manual, threshold):
+                    df, status = predict_handler(audio, metadata, det_enabled, det_threshold, det_min_gap, use_manual, threshold)
+                    plot = create_waveform_plot()
+                    return df, status, plot
+                
                 predict_btn.click(
-                    predict_handler,
+                    predict_with_plot,
                     inputs=[audio_in, meta_in_infer, detector_enabled_infer, detector_threshold_infer, 
                             detector_min_gap_infer, use_manual_thresh, thresh_slider],
-                    outputs=[results_table, status_infer]
+                    outputs=[results_table, status_infer, waveform_plot]
                 )
                 
+                def adjust_with_plot(threshold):
+                    df = adjust_threshold_handler(threshold)
+                    plot = create_waveform_plot()
+                    return df, plot
+                
                 thresh_adjust_slider.change(
-                    adjust_threshold_handler,
+                    adjust_with_plot,
                     inputs=[thresh_adjust_slider],
-                    outputs=[results_table]
+                    outputs=[results_table, waveform_plot]
                 )
                 
                 def export_results():
