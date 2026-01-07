@@ -1,3 +1,4 @@
+import os
 import gradio as gr
 import threading
 import time
@@ -8,6 +9,17 @@ import matplotlib.pyplot as plt
 from . import worker
 from . import config
 from .state import global_state
+
+
+def list_background_roots():
+    """List top-level background folders under AIDataSet for None class selection."""
+    dataset_root = "/isis/home/steing/AIDataSet"
+    try:
+        entries = [d for d in os.listdir(dataset_root) if os.path.isdir(os.path.join(dataset_root, d)) and not d.startswith('.')]
+        return sorted(entries)
+    except Exception:
+        # Fallback to previous hardcoded defaults
+        return ["Noise", "VehicleExhaust", "Wind"]
 
 def get_dataset_summary():
     if global_state.dataset is None:
@@ -30,7 +42,7 @@ def upload_file_handler(file_obj, label, is_background, metadata, det_enabled, d
     msg = worker.add_file(file_obj, label, is_background, metadata)
     return msg, get_dataset_summary()
 
-def start_training_handler(split, batch_size, epochs, lr, hidden_units_str, activation, dropout, target_fpr, none_cap, balance):
+def start_training_handler(split, batch_size, epochs, lr, hidden_units_str, activation, dropout, target_fpr, none_cap, balance, none_classes):
     if global_state.training_status == "Training":
         return "Training already in progress."
     
@@ -52,6 +64,8 @@ def start_training_handler(split, batch_size, epochs, lr, hidden_units_str, acti
     }
     # Default: do not perform balancing unless requested via UI checkbox
     params['balance'] = bool(balance)
+    # User-selected background classes to treat as 'None'
+    params['none_classes'] = none_classes or []
     
     t = threading.Thread(target=worker.train_model, args=(params,))
     t.start()
@@ -287,6 +301,13 @@ with gr.Blocks(title="A3EM AI Trainer") as demo:
                 drop_slider = gr.Slider(0.0, 0.5, value=0.25, label="Dropout")
                 fpr_slider = gr.Slider(0.01, 0.5, value=0.10, label="Target FPR (for None threshold)")
                 none_cap = gr.Number(value=100, label="Max 'None' samples to use (0=disabled)")
+                bg_choices = list_background_roots()
+                default_bg = [c for c in ["Noise", "VehicleExhaust", "Wind"] if c in bg_choices]
+                none_classes_selector = gr.CheckboxGroup(
+                    choices=bg_choices,
+                    value=default_bg if default_bg else bg_choices,
+                    label="Background classes to treat as 'None'"
+                )
         
         train_btn = gr.Button("Start Training", variant="primary")
         status_txt = gr.Textbox(label="Training Status")
@@ -298,7 +319,7 @@ with gr.Blocks(title="A3EM AI Trainer") as demo:
             download_status = gr.Textbox(label="Model Save Status")
             
         train_btn.click(start_training_handler, 
-            inputs=[split_slider, batch_slider, epochs_slider, lr_slider, hidden_in, act_drop, drop_slider, fpr_slider, none_cap, balance_checkbox],
+            inputs=[split_slider, batch_slider, epochs_slider, lr_slider, hidden_in, act_drop, drop_slider, fpr_slider, none_cap, balance_checkbox, none_classes_selector],
             outputs=status_txt)
             
         download_btn.click(download_model_handler, outputs=[download_file, download_status])

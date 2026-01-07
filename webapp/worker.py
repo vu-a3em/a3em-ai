@@ -289,18 +289,21 @@ def train_model(train_params):
                 removed = remove_label_from_dataset(dataset, 'None')
                 global_state.log(f"Removed existing 'None' class: {removed}")
 
+            allowed_roots = train_params.get('none_classes') or ["Noise", "VehicleExhaust", "Wind"]
+
             # Recursively find and load background audio files
-            global_state.log(f"Searching for background samples in /isis/home/steing/AIDataSet...")
+            global_state.log(f"Searching for background samples in /isis/home/steing/AIDataSet under {allowed_roots}...")
             num_added = add_background_samples_recursive(
                 dataset=dataset,
                 dataset_path='/isis/home/steing/AIDataSet',
                 max_samples=int(none_cap),
                 target_sample_rate_hz=config.TARGET_SAMPLE_RATE,
-                target_clip_length=config.TARGET_CLIP_LENGTH
+                target_clip_length=config.TARGET_CLIP_LENGTH,
+                allowed_roots=allowed_roots
             )
             global_state.log(f"Added {num_added} background samples as 'None' class")
             if num_added == 0:
-                global_state.log(f"WARNING: No background samples found. Check dataset path and structure.")
+                global_state.log("WARNING: No background samples found. Check dataset path, allowed roots, and file readability.")
 
         # Set balancing behavior from training params and perform augmentation if requested
         balance = train_params.get('balance', False)
@@ -762,7 +765,7 @@ def save_trained_model():
         return None, error_msg
 
 
-def add_background_samples_recursive(dataset, dataset_path, max_samples, target_sample_rate_hz, target_clip_length):
+def add_background_samples_recursive(dataset, dataset_path, max_samples, target_sample_rate_hz, target_clip_length, allowed_roots=None):
     """
     Recursively find and load background audio files from nested directory structure.
     
@@ -789,9 +792,18 @@ def add_background_samples_recursive(dataset, dataset_path, max_samples, target_
     audio_extensions = {'.wav', '.mp3', '.flac', '.ogg', '.m4a'}
     
     # Recursively find all audio files
+    allowed_set = set(allowed_roots) if allowed_roots else None
+
     for root, dirs, files in os.walk(dataset_path):
         if num_added >= max_samples:
             break
+
+        if allowed_set:
+            # Keep traversal but skip processing files outside allowed roots
+            rel = os.path.relpath(root, dataset_path)
+            top_dir = rel.split(os.sep)[0] if rel not in (".", "") else rel
+            if top_dir and top_dir not in allowed_set:
+                continue
         
         for filename in sorted(files):
             if num_added >= max_samples:
