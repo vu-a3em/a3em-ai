@@ -453,70 +453,283 @@ def train_model(train_params):
         global_state.set_status("Error")
         # raise e # Don't raise in thread, just log
 
-def predict(audio_file, threshold_override=None):
+def predict(audio_file, threshold_override=None, metadata_text=None):
+    """
+    Perform event-level predictions on an audio file.
+    
+    Args:
+        audio_file: File object containing audio
+        threshold_override: Optional manual None-bias threshold
+        metadata_text: Optional manual event timestamps (format: "timestamp,label\n")
+    
+    Returns:
+        List of (timestamp, label, confidence) tuples for each detected event
+    """
     init_system()
     if global_state.classifier is None:
-        return "No model trained.", 0.0, None
+        return [("No model trained", 0.0, 0.0)]
     
     if audio_file is None:
-        return "No audio file.", 0.0, None
+        return [("No audio file", 0.0, 0.0)]
 
-    # Preprocess
-    # We need to load audio, resample, split into clips?
-    # For simplicity, let's assume short clips or take the first clip.
-    # We can use AugmentedDirectoryDataSet's _process_audio_file logic or similar.
-    # But that's internal.
-    # Let's use librosa directly or reuse AudioClip logic.
-    
-    # We need to extract embeddings.
-    # We can create a temporary AudioClip and use the base model.
-    
     # Save temp file
     tmp_path = f"/tmp/{uuid.uuid4().hex}.wav"
     shutil.copy(audio_file.name, tmp_path)
     
     try:
-        # Use base model to get embeddings
-        # Yamnet expects waveform
-        import librosa
+        # Load full audio
         wav, sr = librosa.load(tmp_path, sr=config.TARGET_SAMPLE_RATE)
         
-        # Pad or trim
-        target_len = int(config.TARGET_CLIP_LENGTH * config.TARGET_SAMPLE_RATE)
-        if len(wav) < target_len:
-            wav = np.pad(wav, (0, target_len - len(wav)))
+        # Get event timestamps
+        event_times = []
+        
+        if metadata_text:
+            # Use provided metadata timestamps
+            for line in metadata_text.strip().split('\n'):
+                if not line.strip():
+                    continue
+                parts = line.strip().split(',')
+                if len(parts) >= 1:
+                    try:
+                        timestamp = float(parts[0])
+                        event_times.append(timestamp)
+                    except ValueError:
+                        continue
+        elif global_state.detector_config.get('enabled', True):
+            # Use event detector
+            detector = SpectralFluxDetector(
+                global_state.detector_config.get('threshold', config.DEFAULT_DETECTOR_THRESHOLD),
+                config.TARGET_SAMPLE_RATE,
+                config.DEFAULT_FFT_LENGTH,
+                config.DEFAULT_HOP_LENGTH,
+                False,
+                config.DEFAULT_MIN_FREQ,
+                config.DEFAULT_MAX_FREQ,
+                global_state.detector_config.get('min_gap', config.DEFAULT_DETECTOR_MIN_GAP)
+            )
+            event_times = detector.detect_events(tmp_path)
         else:
-            wav = wav[:target_len]
-            
-        wav = wav.astype(np.float32)
-        # Normalize? Yamnet usually expects -1 to 1 or similar.
-        if np.max(np.abs(wav)) > 0:
-            wav = wav / np.max(np.abs(wav))
-            
-        # Add batch dim
-        wav_batch = np.expand_dims(wav, axis=0)
+            # Fallback: sliding window
+            hop_size = config.TARGET_CLIP_LENGTH / 2  # 50% overlap
+            audio_duration = len(wav) / sr
+            event_times = list(np.arange(0, audio_duration, hop_size))
         
-        embeddings = global_state.base_model(wav_batch, training=False).numpy()
+        if len(event_times) == 0:
+            return [("No events detected", 0.0, 0.0)]
         
-        # Apply None-bias threshold if available
+        # Extract segments and get embeddings for each event
+        target_len = int(config.TARGET_CLIP_LENGTH * config.TARGET_SAMPLE_RATE)
+        all_embeddings = []
+        valid_times = []
+        
+        for t in event_times:
+            start_sample = int(t * sr)
+            end_sample = start_sample + target_len
+            
+            # Extract segment
+            if start_sample >= len(wav):
+                continue
+                
+            segment = wav[start_sample:end_sample]
+            
+            # Pad if needed
+            if len(segment) < target_len:
+                segment = np.pad(segment, (0, target_len - len(segment)))
+            
+            segment = segment.astype(np.float32)
+            
+            # Normalize
+            if np.max(np.abs(segment)) > 0:
+                segment = segment / np.max(np.abs(segment))
+            
+            # Get embeddings
+            segment_batch = np.expand_dims(segment, axis=0)
+            embeddings = global_state.base_model(segment_batch, training=False).numpy()
+            all_embeddings.append(embeddings[0])
+            valid_times.append(t)
+        
+        if len(all_embeddings) == 0:
+            return [("No valid segments", 0.0, 0.0)]
+        
+        # Batch predict all segments
+        embeddings_array = np.array(all_embeddings)
+        probs = global_state.classifier.predict(embeddings_array, verbose=0)
+        
+        # Apply None-bias threshold
         threshold = threshold_override if threshold_override is not None else global_state.none_bias_threshold
         none_idx = global_state.none_idx
         
-        if none_idx is not None and threshold is not None:
-            # Use shared prediction utility with bias correction
-            pred = predict_with_none_bias(global_state.classifier, embeddings, none_idx, threshold)
-            pred_idx = pred[0]
-            probs = global_state.classifier.predict(embeddings)
-        else:
-            # Simple argmax prediction
-            probs = global_state.classifier.predict(embeddings)
-            pred_idx = np.argmax(probs[0])
+        results = []
+        for i, (t, prob_vec) in enumerate(zip(valid_times, probs)):
+            if none_idx is not None and threshold is not None:
+                # Apply bias correction
+                pred_idx = predict_with_none_bias(
+                    global_state.classifier,
+                    embeddings_array[i:i+1],
+                    none_idx,
+                    threshold
+                )[0]
+            else:
+                pred_idx = np.argmax(prob_vec)
             
-        label = global_state.dataset.idx_to_label[pred_idx]
-        confidence = float(probs[0, pred_idx])
+            label = global_state.dataset.idx_to_label[pred_idx]
+            confidence = float(prob_vec[pred_idx])
+            results.append((t, label, confidence))
         
-        return label, confidence, None # Plot?
+        # Cache results and embeddings for threshold adjustment
+        global_state.last_inference_results = results
+        global_state.last_inference_embeddings = embeddings_array
+        
+        return results
 
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
+
+
+def adjust_threshold(new_threshold):
+    """
+    Recalculate predictions using cached embeddings with a new threshold.
+    
+    Args:
+        new_threshold: New None-bias threshold value
+    
+    Returns:
+        List of (timestamp, label, confidence) tuples with updated predictions
+    """
+    if global_state.last_inference_embeddings is None:
+        return [("No cached predictions", 0.0, 0.0)]
+    
+    if global_state.classifier is None:
+        return [("No model trained", 0.0, 0.0)]
+    
+    # Get predictions from cached embeddings
+    embeddings_array = global_state.last_inference_embeddings
+    probs = global_state.classifier.predict(embeddings_array, verbose=0)
+    
+    none_idx = global_state.none_idx
+    results = []
+    
+    # Extract original timestamps
+    original_times = [r[0] for r in global_state.last_inference_results]
+    
+    for i, (t, prob_vec) in enumerate(zip(original_times, probs)):
+        if none_idx is not None and new_threshold is not None:
+            # Apply bias correction with new threshold
+            pred_idx = predict_with_none_bias(
+                global_state.classifier,
+                embeddings_array[i:i+1],
+                none_idx,
+                new_threshold
+            )[0]
+        else:
+            pred_idx = np.argmax(prob_vec)
+        
+        label = global_state.dataset.idx_to_label[pred_idx]
+        confidence = float(prob_vec[pred_idx])
+        results.append((t, label, confidence))
+    
+    # Update cached results
+    global_state.last_inference_results = results
+    
+    return results
+
+
+def evaluate_test_set(audio_files, metadata_files):
+    """
+    Evaluate model performance on a test set with ground truth labels.
+    
+    Args:
+        audio_files: List of audio file objects
+        metadata_files: List of metadata strings (CSV format: timestamp,label)
+    
+    Returns:
+        Dictionary with confusion matrix, classification report, and metrics
+    """
+    init_system()
+    
+    if global_state.classifier is None:
+        return {"error": "No model trained"}
+    
+    if not audio_files or not metadata_files:
+        return {"error": "No test files provided"}
+    
+    from sklearn.metrics import confusion_matrix, classification_report, precision_recall_fscore_support
+    
+    all_true_labels = []
+    all_pred_labels = []
+    all_true_indices = []
+    all_pred_indices = []
+    
+    # Process each test file
+    for audio_file, metadata_text in zip(audio_files, metadata_files):
+        if not metadata_text or not audio_file:
+            continue
+        
+        # Parse metadata to get ground truth
+        ground_truth = {}  # timestamp -> label
+        for line in metadata_text.strip().split('\n'):
+            if not line.strip():
+                continue
+            parts = line.strip().split(',')
+            if len(parts) >= 2:
+                try:
+                    timestamp = float(parts[0])
+                    label = parts[1].strip()
+                    if label.lower() not in ('ignore', 'unknown'):
+                        ground_truth[timestamp] = label
+                except ValueError:
+                    continue
+        
+        if not ground_truth:
+            continue
+        
+        # Get predictions using the same timestamps
+        timestamps_text = '\n'.join([f"{t}" for t in ground_truth.keys()])
+        predictions = predict(audio_file, metadata_text=timestamps_text)
+        
+        # Match predictions to ground truth
+        for pred_time, pred_label, _ in predictions:
+            # Find closest ground truth timestamp (within a small window)
+            closest_gt = min(ground_truth.keys(), key=lambda t: abs(t - pred_time), default=None)
+            if closest_gt is not None and abs(closest_gt - pred_time) < 0.5:  # 0.5s tolerance
+                true_label = ground_truth[closest_gt]
+                all_true_labels.append(true_label)
+                all_pred_labels.append(pred_label)
+                
+                # Convert to indices
+                if true_label in global_state.dataset.label_to_idx:
+                    all_true_indices.append(global_state.dataset.label_to_idx[true_label])
+                    all_pred_indices.append(global_state.dataset.label_to_idx[pred_label])
+    
+    if len(all_true_labels) == 0:
+        return {"error": "No matching predictions found"}
+    
+    # Compute metrics
+    labels_list = sorted(set(all_true_labels + all_pred_labels))
+    cm = confusion_matrix(all_true_labels, all_pred_labels, labels=labels_list)
+    report = classification_report(all_true_labels, all_pred_labels, labels=labels_list, output_dict=True)
+    
+    # Per-class metrics
+    precision, recall, f1, support = precision_recall_fscore_support(
+        all_true_labels, all_pred_labels, labels=labels_list, average=None
+    )
+    
+    per_class = {}
+    for i, label in enumerate(labels_list):
+        per_class[label] = {
+            'precision': float(precision[i]),
+            'recall': float(recall[i]),
+            'f1': float(f1[i]),
+            'support': int(support[i])
+        }
+    
+    # Store in global state
+    global_state.evaluation_metrics = {
+        'confusion_matrix': cm.tolist(),
+        'labels': labels_list,
+        'classification_report': report,
+        'per_class_metrics': per_class
+    }
+    
+    return global_state.evaluation_metrics

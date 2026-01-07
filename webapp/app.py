@@ -2,6 +2,7 @@ import gradio as gr
 import threading
 import time
 import pandas as pd
+import numpy as np
 import matplotlib.pyplot as plt
 
 from . import worker
@@ -78,10 +79,80 @@ def get_roc_plot():
     plt.grid(True)
     return fig
 
-def predict_handler(audio, use_manual, threshold):
+def predict_handler(audio, metadata, det_enabled, det_threshold, det_min_gap, use_manual, threshold):
+    if not audio:
+        return pd.DataFrame(), "No audio file provided."
+    
+    # Update detector config
+    global_state.detector_config['enabled'] = det_enabled
+    global_state.detector_config['threshold'] = det_threshold
+    global_state.detector_config['min_gap'] = det_min_gap
+    
     thresh = threshold if use_manual else None
-    label, conf, _ = worker.predict(audio, thresh)
-    return label, conf
+    results = worker.predict(audio, threshold_override=thresh, metadata_text=metadata)
+    
+    # Convert to dataframe
+    df = pd.DataFrame(results, columns=["Timestamp (s)", "Label", "Confidence"])
+    df["Timestamp (s)"] = df["Timestamp (s)"].apply(lambda x: f"{x:.3f}" if isinstance(x, (int, float)) else x)
+    df["Confidence"] = df["Confidence"].apply(lambda x: f"{x:.3f}" if isinstance(x, (int, float)) else x)
+    
+    status = f"Detected {len(results)} event(s)"
+    return df, status
+
+def adjust_threshold_handler(threshold):
+    results = worker.adjust_threshold(threshold)
+    
+    # Convert to dataframe
+    df = pd.DataFrame(results, columns=["Timestamp (s)", "Label", "Confidence"])
+    df["Timestamp (s)"] = df["Timestamp (s)"].apply(lambda x: f"{x:.3f}" if isinstance(x, (int, float)) else x)
+    df["Confidence"] = df["Confidence"].apply(lambda x: f"{x:.3f}" if isinstance(x, (int, float)) else x)
+    
+    return df
+
+def evaluate_handler(audio_files, metadata_text):
+    if not audio_files or not metadata_text:
+        return None, pd.DataFrame(), "No test data provided."
+    
+    # Split metadata by file (assuming one metadata block per file)
+    # For simplicity, assume user provides matching order
+    metadata_list = [metadata_text] * len(audio_files) if isinstance(audio_files, list) else [metadata_text]
+    
+    metrics = worker.evaluate_test_set(audio_files if isinstance(audio_files, list) else [audio_files], metadata_list)
+    
+    if "error" in metrics:
+        return None, pd.DataFrame(), metrics["error"]
+    
+    # Create confusion matrix plot
+    cm = np.array(metrics['confusion_matrix'])
+    labels = metrics['labels']
+    
+    fig, ax = plt.subplots(figsize=(10, 8))
+    im = ax.imshow(cm, cmap='Blues')
+    
+    ax.set_xticks(np.arange(len(labels)))
+    ax.set_yticks(np.arange(len(labels)))
+    ax.set_xticklabels(labels, rotation=45, ha='right')
+    ax.set_yticklabels(labels)
+    
+    # Add text annotations
+    for i in range(len(labels)):
+        for j in range(len(labels)):
+            text = ax.text(j, i, cm[i, j], ha="center", va="center", color="black")
+    
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("True")
+    ax.set_title("Confusion Matrix")
+    plt.colorbar(im, ax=ax)
+    plt.tight_layout()
+    
+    # Create metrics dataframe
+    per_class = metrics['per_class_metrics']
+    df = pd.DataFrame.from_dict(per_class, orient='index')
+    df = df.reset_index().rename(columns={'index': 'Label'})
+    
+    status = f"Evaluated on {sum(per_class[l]['support'] for l in per_class)} samples"
+    
+    return fig, df, status
 
 with gr.Blocks(title="A3EM AI Trainer") as demo:
     gr.Markdown("# A3EM AI Few-Shot Trainer")
@@ -146,21 +217,109 @@ with gr.Blocks(title="A3EM AI Trainer") as demo:
         demo.load(get_status_handler, None, status_txt)
 
     with gr.Tab("Inference & Analysis"):
-        with gr.Row():
-            with gr.Column():
-                audio_in = gr.File(label="Test Audio")
-                use_manual_thresh = gr.Checkbox(label="Use Manual Threshold", value=False)
-                thresh_slider = gr.Slider(-1.0, 1.0, value=0.0, label="None-bias Threshold Override")
-                predict_btn = gr.Button("Predict")
+        with gr.Tabs():
+            with gr.Tab("Single File Prediction"):
+                with gr.Row():
+                    with gr.Column():
+                        audio_in = gr.File(label="Test Audio File")
+                        meta_in_infer = gr.TextArea(
+                            label="Manual Event Timestamps (optional)", 
+                            placeholder="6.725604\n8.125000\n12.450000",
+                            info="One timestamp per line. Leave empty to use detector."
+                        )
+                        
+                        with gr.Accordion("Event Detection Settings", open=False):
+                            detector_enabled_infer = gr.Checkbox(label="Enable Event Detection", value=True)
+                            detector_threshold_infer = gr.Slider(1.0, 20.0, value=config.DEFAULT_DETECTOR_THRESHOLD, label="Detection Threshold")
+                            detector_min_gap_infer = gr.Slider(0.01, 1.0, value=config.DEFAULT_DETECTOR_MIN_GAP, label="Min Gap (s)")
+                        
+                        use_manual_thresh = gr.Checkbox(label="Use Manual Threshold", value=False)
+                        thresh_slider = gr.Slider(-1.0, 1.0, value=0.0, label="None-bias Threshold Override", step=0.01)
+                        
+                        predict_btn = gr.Button("Predict Events", variant="primary")
+                        status_infer = gr.Textbox(label="Status")
+                    
+                    with gr.Column():
+                        results_table = gr.Dataframe(
+                            label="Event Predictions",
+                            headers=["Timestamp (s)", "Label", "Confidence"],
+                            interactive=False
+                        )
+                        
+                        gr.Markdown("### Adjust Threshold")
+                        thresh_adjust_slider = gr.Slider(
+                            -1.0, 1.0, value=0.0, step=0.01,
+                            label="Adjust None-bias Threshold",
+                            info="Drag to recalculate predictions with cached embeddings"
+                        )
+                        
+                        export_btn = gr.Button("Export Results as CSV")
+                        export_file = gr.File(label="Download CSV", visible=False)
+                
+                predict_btn.click(
+                    predict_handler,
+                    inputs=[audio_in, meta_in_infer, detector_enabled_infer, detector_threshold_infer, 
+                            detector_min_gap_infer, use_manual_thresh, thresh_slider],
+                    outputs=[results_table, status_infer]
+                )
+                
+                thresh_adjust_slider.change(
+                    adjust_threshold_handler,
+                    inputs=[thresh_adjust_slider],
+                    outputs=[results_table]
+                )
+                
+                def export_results():
+                    if not global_state.last_inference_results:
+                        return None
+                    df = pd.DataFrame(global_state.last_inference_results, 
+                                    columns=["Timestamp (s)", "Label", "Confidence"])
+                    path = "/tmp/predictions.csv"
+                    df.to_csv(path, index=False)
+                    return path
+                
+                export_btn.click(export_results, outputs=[export_file])
             
-            with gr.Column():
-                pred_label = gr.Textbox(label="Predicted Label")
-                pred_conf = gr.Textbox(label="Confidence")
-                roc_plot = gr.Plot(label="ROC Curve")
-                refresh_roc = gr.Button("Refresh ROC")
-        
-        predict_btn.click(predict_handler, inputs=[audio_in, use_manual_thresh, thresh_slider], outputs=[pred_label, pred_conf])
-        refresh_roc.click(get_roc_plot, outputs=roc_plot)
+            with gr.Tab("Test Set Evaluation"):
+                with gr.Row():
+                    with gr.Column():
+                        test_audio_in = gr.File(label="Test Audio File(s)", file_count="multiple")
+                        test_meta_in = gr.TextArea(
+                            label="Ground Truth Metadata (CSV: timestamp,label)",
+                            placeholder="6.725604,Gunshot\n8.125000,Explosion\n12.450000,None",
+                            info="Provide ground truth labels for evaluation"
+                        )
+                        evaluate_btn = gr.Button("Evaluate Model", variant="primary")
+                        eval_status = gr.Textbox(label="Status")
+                    
+                    with gr.Column():
+                        confusion_plot = gr.Plot(label="Confusion Matrix")
+                        metrics_table = gr.Dataframe(
+                            label="Per-Class Metrics",
+                            headers=["Label", "Precision", "Recall", "F1", "Support"]
+                        )
+                
+                evaluate_btn.click(
+                    evaluate_handler,
+                    inputs=[test_audio_in, test_meta_in],
+                    outputs=[confusion_plot, metrics_table, eval_status]
+                )
+            
+            with gr.Tab("ROC Analysis"):
+                with gr.Row():
+                    with gr.Column():
+                        refresh_roc = gr.Button("Refresh ROC Curve")
+                        gr.Markdown("""
+                        **ROC Curve**: Shows the trade-off between True Positive Rate and False Positive Rate
+                        for the None-bias threshold. Use this to understand how threshold changes affect
+                        None-class detection.
+                        """)
+                    
+                    with gr.Column():
+                        roc_plot = gr.Plot(label="ROC Curve")
+                
+                refresh_roc.click(get_roc_plot, outputs=roc_plot)
+                demo.load(get_roc_plot, outputs=roc_plot)
 
 if __name__ == "__main__":
     # Initialize system on startup

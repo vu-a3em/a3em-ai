@@ -18,6 +18,15 @@ class AppState:
             'threshold': 9.0,
             'min_gap': 0.1
         }
+        # Inference results - list of (timestamp, label, confidence, all_probs)
+        self.last_inference_results = []
+        self.last_inference_embeddings = None  # Cache embeddings for threshold tuning
+        # Evaluation metrics
+        self.evaluation_metrics = {
+            'confusion_matrix': None,
+            'classification_report': None,
+            'per_class_metrics': {}
+        }
 
     def log(self, message):
         with self.lock:
