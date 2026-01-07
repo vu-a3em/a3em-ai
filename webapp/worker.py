@@ -289,19 +289,18 @@ def train_model(train_params):
                 removed = remove_label_from_dataset(dataset, 'None')
                 global_state.log(f"Removed existing 'None' class: {removed}")
 
-            background_classes = ['Noise', 'VehicleExhaust', 'Wind']
-            dataset_path = '/isis/home/steing/AIDataSet'
-            
-            num_added = add_background_as_none(
+            # Recursively find and load background audio files
+            global_state.log(f"Searching for background samples in /isis/home/steing/AIDataSet...")
+            num_added = add_background_samples_recursive(
                 dataset=dataset,
-                dataset_path=dataset_path,
-                background_classes=background_classes,
-                max_none_samples=int(none_cap),
+                dataset_path='/isis/home/steing/AIDataSet',
+                max_samples=int(none_cap),
                 target_sample_rate_hz=config.TARGET_SAMPLE_RATE,
-                target_clip_length=config.TARGET_CLIP_LENGTH,
-                use_metadata=True
+                target_clip_length=config.TARGET_CLIP_LENGTH
             )
             global_state.log(f"Added {num_added} background samples as 'None' class")
+            if num_added == 0:
+                global_state.log(f"WARNING: No background samples found. Check dataset path and structure.")
 
         # Set balancing behavior from training params and perform augmentation if requested
         balance = train_params.get('balance', False)
@@ -761,3 +760,68 @@ def save_trained_model():
         error_msg = f"Error saving model: {str(e)}"
         global_state.log(error_msg)
         return None, error_msg
+
+
+def add_background_samples_recursive(dataset, dataset_path, max_samples, target_sample_rate_hz, target_clip_length):
+    """
+    Recursively find and load background audio files from nested directory structure.
+    
+    Args:
+        dataset: AugmentedDirectoryDataSet instance
+        dataset_path: Root path to search for audio files
+        max_samples: Maximum number of samples to load
+        target_sample_rate_hz: Sample rate for loading audio
+        target_clip_length: Duration of each clip
+    
+    Returns:
+        Number of samples added
+    """
+    import os
+    from pathlib import Path
+    
+    # Ensure 'None' label exists
+    if 'None' not in dataset.label_to_idx:
+        dataset.label_to_idx['None'] = len(dataset.label_to_idx)
+        dataset.idx_to_label[dataset.label_to_idx['None']] = 'None'
+        dataset.label_counts['None'] = 0
+    
+    num_added = 0
+    audio_extensions = {'.wav', '.mp3', '.flac', '.ogg', '.m4a'}
+    
+    # Recursively find all audio files
+    for root, dirs, files in os.walk(dataset_path):
+        if num_added >= max_samples:
+            break
+        
+        for filename in sorted(files):
+            if num_added >= max_samples:
+                break
+            
+            ext = os.path.splitext(filename)[1].lower()
+            if ext not in audio_extensions:
+                continue
+            
+            filepath = os.path.join(root, filename)
+            
+            try:
+                # Create clip at start of file
+                clip = AudioClip(
+                    label_idx=dataset.label_to_idx['None'],
+                    label='None',
+                    path=filepath,
+                    start_seconds=0.0,
+                    end_seconds=target_clip_length,
+                    target_sample_rate_hz=target_sample_rate_hz
+                )
+                
+                # Try to load to validate file exists and is readable
+                wav, sr = librosa.load(filepath, sr=target_sample_rate_hz)
+                if len(wav) > 0:
+                    dataset.clips.append(clip)
+                    dataset.label_counts['None'] += 1
+                    num_added += 1
+            except Exception as e:
+                # Skip files that can't be loaded
+                continue
+    
+    return num_added

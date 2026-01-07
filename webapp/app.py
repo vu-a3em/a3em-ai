@@ -113,8 +113,13 @@ def adjust_threshold_handler(threshold):
     
     return df
 
-def create_waveform_plot():
-    """Create waveform visualization with event markers."""
+def create_waveform_plot(start_time=None, end_time=None):
+    """Create waveform visualization with event markers.
+    
+    Args:
+        start_time: Start time in seconds (None = beginning)
+        end_time: End time in seconds (None = end)
+    """
     if not global_state.last_audio_data or not global_state.last_inference_results:
         return None
     
@@ -123,36 +128,52 @@ def create_waveform_plot():
         wav, sr = global_state.last_audio_data
         duration = len(wav) / sr
         
+        # Handle time range
+        start_time = start_time or 0.0
+        end_time = end_time or duration
+        start_time = max(0, min(start_time, duration))
+        end_time = max(start_time, min(end_time, duration))
+        
+        # Extract time range
+        start_sample = int(start_time * sr)
+        end_sample = int(end_time * sr)
+        wav_range = wav[start_sample:end_sample]
+        time_range = np.arange(len(wav_range)) / sr + start_time
+        
         # Downsample waveform for display if longer than 2 minutes
         max_display_samples = sr * 120  # 2 minutes at full resolution
-        if len(wav) > max_display_samples:
-            downsample_factor = int(np.ceil(len(wav) / max_display_samples))
-            wav_display = wav[::downsample_factor]
-            time_display = np.arange(len(wav_display)) * downsample_factor / sr
+        if len(wav_range) > max_display_samples:
+            downsample_factor = int(np.ceil(len(wav_range) / max_display_samples))
+            wav_display = wav_range[::downsample_factor]
+            time_display = time_range[::downsample_factor]
         else:
-            wav_display = wav
-            time_display = np.arange(len(wav)) / sr
+            wav_display = wav_range
+            time_display = time_range
         
         # Create figure
         fig, ax = plt.subplots(figsize=(14, 4))
         ax.plot(time_display, wav_display, color='steelblue', linewidth=0.5, alpha=0.7)
         ax.set_xlabel('Time (s)')
         ax.set_ylabel('Amplitude')
-        ax.set_title(f'Audio Waveform with Detected Events ({duration:.1f}s total)')
+        ax.set_title(f'Audio Waveform with Detected Events ({start_time:.1f}s - {end_time:.1f}s)')
         ax.grid(True, alpha=0.3)
+        ax.set_xlim(start_time, end_time)
         
         # Get unique labels for color mapping
         labels_in_results = list(set(r[1] for r in global_state.last_inference_results))
         colors = plt.cm.tab10(np.linspace(0, 1, len(labels_in_results)))
         label_to_color = {label: colors[i] for i, label in enumerate(labels_in_results)}
         
-        # Add event markers
+        # Add event markers (only within time range)
         y_min, y_max = ax.get_ylim()
         y_range = y_max - y_min
         label_y = y_max - y_range * 0.1  # Position labels near top
         
         for timestamp, label, confidence in global_state.last_inference_results:
             if not isinstance(timestamp, (int, float)):
+                continue
+            # Only show events within the selected time range
+            if timestamp < start_time or timestamp > end_time:
                 continue
                 
             color = label_to_color.get(label, 'red')
@@ -332,6 +353,17 @@ with gr.Blocks(title="A3EM AI Trainer") as demo:
                             info="Drag to recalculate predictions with cached embeddings"
                         )
                         
+                        gr.Markdown("### Zoom Waveform (optional)")
+                        with gr.Row():
+                            wf_start_slider = gr.Slider(
+                                0, 600, value=0, step=0.1,
+                                label="Start Time (s)"
+                            )
+                            wf_end_slider = gr.Slider(
+                                0, 600, value=600, step=0.1,
+                                label="End Time (s)"
+                            )
+                        
                         export_btn = gr.Button("Export Results as CSV")
                         export_file = gr.File(label="Download CSV", visible=False)
                 
@@ -347,15 +379,31 @@ with gr.Blocks(title="A3EM AI Trainer") as demo:
                     outputs=[results_table, status_infer, waveform_plot]
                 )
                 
-                def adjust_with_plot(threshold):
+                def adjust_with_plot(threshold, wf_start, wf_end):
                     df = adjust_threshold_handler(threshold)
-                    plot = create_waveform_plot()
+                    plot = create_waveform_plot(start_time=wf_start, end_time=wf_end)
                     return df, plot
                 
                 thresh_adjust_slider.change(
                     adjust_with_plot,
-                    inputs=[thresh_adjust_slider],
+                    inputs=[thresh_adjust_slider, wf_start_slider, wf_end_slider],
                     outputs=[results_table, waveform_plot]
+                )
+                
+                # Also update when time range sliders change
+                def update_waveform_range(wf_start, wf_end):
+                    plot = create_waveform_plot(start_time=wf_start, end_time=wf_end)
+                    return plot
+                
+                wf_start_slider.change(
+                    update_waveform_range,
+                    inputs=[wf_start_slider, wf_end_slider],
+                    outputs=[waveform_plot]
+                )
+                wf_end_slider.change(
+                    update_waveform_range,
+                    inputs=[wf_start_slider, wf_end_slider],
+                    outputs=[waveform_plot]
                 )
                 
                 def export_results():
